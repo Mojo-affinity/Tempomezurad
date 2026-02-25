@@ -1,1 +1,14 @@
 @import "tailwindcss";
+
+@keyframes timer-breathe {
+  0%, 100% {
+    box-shadow: 0 0 6px 2px rgba(59, 130, 246, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 22px 7px rgba(59, 130, 246, 0.55);
+  }
+}
+
+@theme {
+  --animate-timer-breathe: timer-breathe 2.5s ease-in-out infinite;
+}

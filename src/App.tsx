@@ -366,10 +366,24 @@ function App() {
       </div>
 
       {/* タイマー表示エリア */}
-      <div class="shrink-0 flex flex-col items-center gap-1 py-4 bg-gray-800 border-b border-gray-700">
-        <div class="text-4xl font-mono tabular-nums tracking-widest">
-          {formatSeconds(elapsedSeconds())}
+      <div class="shrink-0 flex flex-col items-center gap-2 py-4 bg-gray-800 border-b border-gray-700">
+        {/* 時間表示ブロック: 計測中に呼吸する枠線グロー */}
+        <div
+          class={`px-8 py-2 rounded-xl border transition-colors duration-500 ${
+            activeInfo().task_id !== null
+              ? "border-blue-500/50 animate-timer-breathe"
+              : "border-gray-700/60"
+          }`}
+        >
+          <div
+            class={`text-4xl font-mono tabular-nums tracking-widest transition-colors duration-300 ${
+              activeInfo().task_id !== null ? "text-blue-100" : "text-gray-300"
+            }`}
+          >
+            {formatSeconds(elapsedSeconds())}
+          </div>
         </div>
+
         <Show
           when={activeInfo().task_id !== null}
           fallback={<p class="text-gray-500 text-xs">タスクを選択してください</p>}
