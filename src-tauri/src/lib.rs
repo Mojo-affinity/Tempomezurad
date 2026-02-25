@@ -98,7 +98,6 @@ fn save_data(app: &AppHandle, data: &AppData) -> Result<(), String> {
 
 // ============================================================
 // 共通ヘルパー: アクティブタスク停止
-// コマンドとグローバルショートカットハンドラで共用
 // ============================================================
 
 fn stop_task_inner(app: &AppHandle) -> Result<(), String> {
@@ -126,6 +125,19 @@ fn stop_task_inner(app: &AppHandle) -> Result<(), String> {
     *active_task_start = None;
 
     save_data(app, &data)
+}
+
+// ============================================================
+// 共通ヘルパー: ウィンドウをフォーカス (グローバルショートカット用)
+// ============================================================
+
+fn focus_window_inner(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        // 最小化されていた場合に復元し、最前面へ引き上げる
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 // ============================================================
@@ -280,7 +292,6 @@ fn add_task(
 /// 全タイムログを CSV に書き出してパスを返す
 #[tauri::command]
 fn export_csv(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    // ロック時間を最小化するためにデータをクローン
     let data = {
         let lock = state.data.lock().unwrap();
         lock.clone()
@@ -344,6 +355,17 @@ fn set_always_on_top(app: AppHandle, value: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// カスタムタイトルバーからのドラッグ開始
+/// data-tauri-drag-region は Linux で動作しない環境があるため、
+/// mousedown イベントから明示的に呼び出す方式に変更
+#[tauri::command]
+fn start_dragging(app: AppHandle) -> Result<(), String> {
+    app.get_webview_window("main")
+        .ok_or_else(|| "ウィンドウが見つかりません".to_string())?
+        .start_dragging()
+        .map_err(|e| e.to_string())
+}
+
 // ============================================================
 // エントリーポイント
 // ============================================================
@@ -353,12 +375,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(
-            // グローバルショートカット: Ctrl+Shift+S でアクティブタスクを停止
+            // グローバルショートカット: Ctrl+Shift+Space でウィンドウをフォーカス
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if matches!(event.state, ShortcutState::Pressed) {
-                        let _ = stop_task_inner(app);
-                        let _ = app.emit("task-stopped", ());
+                        focus_window_inner(app);
+                        // フロントエンドに通知してタスクナビゲーションモードを開始させる
+                        let _ = app.emit("window-activated", ());
                     }
                 })
                 .build(),
@@ -372,7 +395,7 @@ pub fn run() {
             });
 
             // ショートカット登録 (失敗してもアプリは起動継続)
-            if let Err(e) = app.global_shortcut().register("Ctrl+Shift+S") {
+            if let Err(e) = app.global_shortcut().register("Ctrl+Shift+Space") {
                 eprintln!("グローバルショートカット登録失敗: {e}");
             }
 
@@ -386,6 +409,7 @@ pub fn run() {
             add_task,
             export_csv,
             set_always_on_top,
+            start_dragging,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

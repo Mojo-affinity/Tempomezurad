@@ -77,6 +77,20 @@ function App() {
   const [taskName, setTaskName] = createSignal("");
   const [taskTag, setTaskTag] = createSignal("");
 
+  // --- Tab キーナビゲーション: 現在フォーカス中のタスクのフラットインデックス (-1 = 非アクティブ) ---
+  const [focusedTaskIndex, setFocusedTaskIndex] = createSignal(-1);
+
+  // 全オペレーション配下のタスク ID をフラットに列挙 (Tab ナビ用)
+  const flatTaskIds = (): string[] => {
+    const ids: string[] = [];
+    for (const op of operations()) {
+      for (const task of op.tasks) {
+        ids.push(task.id);
+      }
+    }
+    return ids;
+  };
+
   // --- Rust との同期 ---
   const syncState = async () => {
     const state = await invoke<AppStateView>("get_state");
@@ -92,21 +106,6 @@ function App() {
       setElapsedSeconds((s) => s + 1);
     }
   }, 1000);
-
-  // グローバルショートカット (Ctrl+Shift+S) で Rust がタスク停止 → イベントを受信して再同期
-  let unlistenTaskStopped: (() => void) | undefined;
-
-  onMount(async () => {
-    await syncState();
-    unlistenTaskStopped = await listen("task-stopped", async () => {
-      await syncState();
-    });
-  });
-
-  onCleanup(() => {
-    clearInterval(timer);
-    unlistenTaskStopped?.();
-  });
 
   // --- タスク操作 ---
   const handleStartTask = async (taskId: string) => {
@@ -143,7 +142,6 @@ function App() {
     try {
       const path = await invoke<string>("export_csv");
       setExportMsg(path);
-      // 5 秒後にメッセージを消す
       setTimeout(() => setExportMsg(null), 5000);
     } catch (e) {
       console.error("export_csv エラー:", e);
@@ -187,6 +185,77 @@ function App() {
     }
   };
 
+  // --- Tab / Enter / Escape によるキーボードナビゲーション ---
+  // input/textarea にフォーカスがある場合はスキップして通常入力を妨げない
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (
+      e.target instanceof HTMLInputElement ||
+      e.target instanceof HTMLTextAreaElement
+    ) {
+      return;
+    }
+
+    const ids = flatTaskIds();
+    if (ids.length === 0) return;
+
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const cur = focusedTaskIndex();
+      const next = e.shiftKey
+        ? cur <= 0
+          ? ids.length - 1
+          : cur - 1
+        : cur < 0 || cur >= ids.length - 1
+          ? 0
+          : cur + 1;
+      setFocusedTaskIndex(next);
+      // DOM 更新後にスクロール
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-task-id="${ids[next]}"]`)
+          ?.scrollIntoView({ block: "nearest" });
+      });
+    } else if (e.key === "Enter") {
+      const idx = focusedTaskIndex();
+      if (idx >= 0 && idx < ids.length) {
+        setFocusedTaskIndex(-1);
+        handleStartTask(ids[idx]);
+      }
+    } else if (e.key === "Escape") {
+      setFocusedTaskIndex(-1);
+    }
+  };
+
+  // --- グローバルショートカット (Ctrl+Shift+Space) で Rust がウィンドウをフォーカス → イベント受信 ---
+  let unlistenWindowActivated: (() => void) | undefined;
+
+  onMount(async () => {
+    await syncState();
+
+    unlistenWindowActivated = await listen("window-activated", async () => {
+      // Rust 側で既にウィンドウは最前面に引き上げ済み
+      // 状態を最新化してから最初のタスクにフォーカスを移す
+      await syncState();
+      const ids = flatTaskIds();
+      setFocusedTaskIndex(ids.length > 0 ? 0 : -1);
+      requestAnimationFrame(() => {
+        if (ids.length > 0) {
+          document
+            .querySelector(`[data-task-id="${ids[0]}"]`)
+            ?.scrollIntoView({ block: "nearest" });
+        }
+      });
+    });
+
+    document.addEventListener("keydown", handleKeyDown);
+  });
+
+  onCleanup(() => {
+    clearInterval(timer);
+    unlistenWindowActivated?.();
+    document.removeEventListener("keydown", handleKeyDown);
+  });
+
   // ============================================================
   // UI
   // ============================================================
@@ -194,9 +263,20 @@ function App() {
   return (
     <main class="w-screen h-screen bg-gray-900 text-white font-sans flex flex-col overflow-hidden text-sm">
 
-      {/* ドラッグ可能なカスタムヘッダー */}
+      {/*
+        カスタムヘッダー (ドラッグ移動)
+        - data-tauri-drag-region は Linux 環境によって動作しない場合があるため廃止
+        - mousedown (左ボタン) で Rust の start_dragging コマンドを呼ぶ方式に変更
+        - ボタン等のインタラクティブ要素は onMouseDown で stopPropagation することで
+          ドラッグ領域から除外される
+      */}
       <div
-        data-tauri-drag-region
+        onMouseDown={(e) => {
+          // 左ボタン押下かつドラッグ対象要素 (button でない) の場合のみ
+          if (e.buttons === 1 && !(e.target instanceof HTMLButtonElement)) {
+            invoke("start_dragging").catch(() => {});
+          }
+        }}
         class="h-8 bg-gray-800 flex items-center justify-between px-2 shrink-0 cursor-move select-none border-b border-gray-700"
       >
         <span class="text-xs font-bold text-gray-400 pointer-events-none">
@@ -292,21 +372,41 @@ function App() {
               <For each={op.tasks}>
                 {(task) => {
                   const isActive = () => activeInfo().task_id === task.id;
+                  // このタスクのグローバルインデックスを都度計算
+                  const globalIdx = () => flatTaskIds().indexOf(task.id);
+                  const isFocused = () =>
+                    focusedTaskIndex() >= 0 &&
+                    focusedTaskIndex() === globalIdx();
+
                   return (
                     <button
-                      onClick={() => handleStartTask(task.id)}
+                      data-task-id={task.id}
+                      onClick={() => {
+                        setFocusedTaskIndex(-1);
+                        handleStartTask(task.id);
+                      }}
                       class={`w-full flex items-center justify-between px-3 py-2 text-left border-t border-gray-700 transition-colors ${
                         isActive()
                           ? "bg-blue-950 text-blue-300"
-                          : "bg-gray-800 hover:bg-gray-700 text-gray-300"
+                          : isFocused()
+                            ? "bg-gray-700 text-white ring-2 ring-inset ring-blue-400"
+                            : "bg-gray-800 hover:bg-gray-700 text-gray-300"
                       }`}
                     >
                       <span class="truncate">{task.name}</span>
-                      <Show when={task.tag}>
-                        <span class="ml-2 shrink-0 text-xs px-1.5 py-0.5 rounded bg-gray-700 text-gray-400">
-                          {task.tag}
-                        </span>
-                      </Show>
+                      <div class="flex items-center gap-1.5 shrink-0 ml-2">
+                        <Show when={task.tag}>
+                          <span class="text-xs px-1.5 py-0.5 rounded bg-gray-700 text-gray-400">
+                            {task.tag}
+                          </span>
+                        </Show>
+                        {/* Tab ナビゲーション中のフォーカスインジケーター */}
+                        <Show when={isFocused()}>
+                          <span class="text-blue-400 text-xs font-bold">
+                            ↵
+                          </span>
+                        </Show>
+                      </div>
                     </button>
                   );
                 }}
@@ -406,7 +506,9 @@ function App() {
 
       {/* ショートカット情報 */}
       <div class="shrink-0 px-3 py-1.5 bg-gray-800 border-t border-gray-700">
-        <p class="text-gray-600 text-xs text-center">Ctrl+Shift+S で停止</p>
+        <p class="text-gray-600 text-xs text-center">
+          Ctrl+Shift+Space → Tab でタスク選択 → Enter で開始
+        </p>
       </div>
     </main>
   );
