@@ -16,6 +16,7 @@ interface Task {
   name: string;
   tag: string;
   time_logs: TimeLog[];
+  hidden: boolean;
 }
 
 interface Operation {
@@ -23,6 +24,7 @@ interface Operation {
   name: string;
   description: string;
   tasks: Task[];
+  hidden: boolean;
 }
 
 interface ActiveTaskInfo {
@@ -63,9 +65,12 @@ function App() {
   });
   const [elapsedSeconds, setElapsedSeconds] = createSignal(0);
 
-  // --- Phase 4: ピン / エクスポート ---
+  // --- ピン / エクスポート ---
   const [pinned, setPinned] = createSignal(false);
   const [exportMsg, setExportMsg] = createSignal<string | null>(null);
+
+  // --- 非表示項目の表示切り替え ---
+  const [showHidden, setShowHidden] = createSignal(false);
 
   // --- フォーム表示制御 ---
   const [showAddOperation, setShowAddOperation] = createSignal(false);
@@ -80,11 +85,13 @@ function App() {
   // --- Tab キーナビゲーション: 現在フォーカス中のタスクのフラットインデックス (-1 = 非アクティブ) ---
   const [focusedTaskIndex, setFocusedTaskIndex] = createSignal(-1);
 
-  // 全オペレーション配下のタスク ID をフラットに列挙 (Tab ナビ用)
+  // 表示中のタスク ID をフラットに列挙 (Tab ナビ用)
   const flatTaskIds = (): string[] => {
     const ids: string[] = [];
     for (const op of operations()) {
+      if (op.hidden && !showHidden()) continue;
       for (const task of op.tasks) {
+        if (task.hidden && !showHidden()) continue;
         ids.push(task.id);
       }
     }
@@ -185,6 +192,48 @@ function App() {
     }
   };
 
+  // --- 並べ替え ---
+  const handleReorderOperation = async (opId: string, direction: "up" | "down") => {
+    try {
+      await invoke("reorder_operation", { opId, direction });
+      await syncState();
+    } catch (e) {
+      console.error("reorder_operation エラー:", e);
+    }
+  };
+
+  const handleReorderTask = async (
+    opId: string,
+    taskId: string,
+    direction: "up" | "down"
+  ) => {
+    try {
+      await invoke("reorder_task", { opId, taskId, direction });
+      await syncState();
+    } catch (e) {
+      console.error("reorder_task エラー:", e);
+    }
+  };
+
+  // --- 表示/非表示 ---
+  const handleToggleOperationVisibility = async (opId: string) => {
+    try {
+      await invoke("toggle_operation_visibility", { opId });
+      await syncState();
+    } catch (e) {
+      console.error("toggle_operation_visibility エラー:", e);
+    }
+  };
+
+  const handleToggleTaskVisibility = async (taskId: string) => {
+    try {
+      await invoke("toggle_task_visibility", { taskId });
+      await syncState();
+    } catch (e) {
+      console.error("toggle_task_visibility エラー:", e);
+    }
+  };
+
   // --- Tab / Enter / Escape によるキーボードナビゲーション ---
   // input/textarea にフォーカスがある場合はスキップして通常入力を妨げない
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -209,7 +258,6 @@ function App() {
           ? 0
           : cur + 1;
       setFocusedTaskIndex(next);
-      // DOM 更新後にスクロール
       requestAnimationFrame(() => {
         document
           .querySelector(`[data-task-id="${ids[next]}"]`)
@@ -233,8 +281,6 @@ function App() {
     await syncState();
 
     unlistenWindowActivated = await listen("window-activated", async () => {
-      // Rust 側で既にウィンドウは最前面に引き上げ済み
-      // 状態を最新化してから最初のタスクにフォーカスを移す
       await syncState();
       const ids = flatTaskIds();
       setFocusedTaskIndex(ids.length > 0 ? 0 : -1);
@@ -260,19 +306,18 @@ function App() {
   // UI
   // ============================================================
 
+  // 並べ替え/非表示ボタンの共通スタイル
+  const ctrlBtn =
+    "w-5 h-5 flex items-center justify-center rounded text-xs transition-colors";
+
   return (
     <main class="w-screen h-screen bg-gray-900 text-white font-sans flex flex-col overflow-hidden text-sm">
 
       {/*
         カスタムヘッダー (ドラッグ移動)
-        - data-tauri-drag-region は Linux 環境によって動作しない場合があるため廃止
-        - mousedown (左ボタン) で Rust の start_dragging コマンドを呼ぶ方式に変更
-        - ボタン等のインタラクティブ要素は onMouseDown で stopPropagation することで
-          ドラッグ領域から除外される
       */}
       <div
         onMouseDown={(e) => {
-          // 左ボタン押下かつドラッグ対象要素 (button でない) の場合のみ
           if (e.buttons === 1 && !(e.target instanceof HTMLButtonElement)) {
             invoke("start_dragging").catch(() => {});
           }
@@ -292,6 +337,18 @@ function App() {
             class="w-6 h-6 flex items-center justify-center text-gray-500 hover:text-green-400 rounded transition-colors text-xs"
           >
             ↓
+          </button>
+          {/* 非表示項目の表示トグル */}
+          <button
+            onClick={() => setShowHidden((v) => !v)}
+            title={showHidden() ? "非表示項目を隠す" : "非表示項目を表示する"}
+            class={`w-6 h-6 flex items-center justify-center rounded transition-colors text-xs ${
+              showHidden()
+                ? "text-orange-400 hover:text-orange-300"
+                : "text-gray-500 hover:text-gray-300"
+            }`}
+          >
+            👁
           </button>
           {/* ピン (常時最前面) トグル */}
           <button
@@ -338,13 +395,22 @@ function App() {
 
       {/* Operation / Task リスト */}
       <div class="flex-1 overflow-y-auto p-2 space-y-2">
-        <For each={operations()}>
+        <For
+          each={
+            showHidden()
+              ? operations()
+              : operations().filter((op) => !op.hidden)
+          }
+        >
           {(op) => (
-            <div class="rounded-md overflow-hidden border border-gray-700">
-
+            <div
+              class={`rounded-md overflow-hidden border border-gray-700 ${
+                op.hidden ? "opacity-60" : ""
+              }`}
+            >
               {/* Operation ヘッダー */}
               <div class="flex items-center justify-between px-3 py-2 bg-gray-700">
-                <div class="min-w-0">
+                <div class="min-w-0 flex-1">
                   <span class="font-semibold text-gray-200 truncate block">
                     {op.name}
                   </span>
@@ -354,22 +420,63 @@ function App() {
                     </span>
                   </Show>
                 </div>
-                <button
-                  onClick={() => {
-                    setAddTaskForOpId(
-                      addTaskForOpId() === op.id ? null : op.id
-                    );
-                    setTaskName("");
-                    setTaskTag("");
-                  }}
-                  class="ml-2 shrink-0 text-gray-500 hover:text-blue-400 text-xs transition-colors"
-                >
-                  ＋
-                </button>
+
+                {/* 操作ボタン群 */}
+                <div class="flex items-center gap-0.5 ml-2 shrink-0">
+                  <button
+                    onClick={() => handleReorderOperation(op.id, "up")}
+                    disabled={operations()[0]?.id === op.id}
+                    title="上に移動"
+                    class={`${ctrlBtn} text-gray-600 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed`}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    onClick={() => handleReorderOperation(op.id, "down")}
+                    disabled={
+                      operations()[operations().length - 1]?.id === op.id
+                    }
+                    title="下に移動"
+                    class={`${ctrlBtn} text-gray-600 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed`}
+                  >
+                    ↓
+                  </button>
+                  <button
+                    onClick={() => handleToggleOperationVisibility(op.id)}
+                    title={op.hidden ? "再表示する" : "非表示にする"}
+                    class={`${ctrlBtn} ${
+                      op.hidden
+                        ? "text-orange-400 hover:text-orange-300"
+                        : "text-gray-600 hover:text-gray-300"
+                    }`}
+                  >
+                    👁
+                  </button>
+                  <Show when={!op.hidden}>
+                    <button
+                      onClick={() => {
+                        setAddTaskForOpId(
+                          addTaskForOpId() === op.id ? null : op.id
+                        );
+                        setTaskName("");
+                        setTaskTag("");
+                      }}
+                      class={`${ctrlBtn} text-gray-500 hover:text-blue-400`}
+                    >
+                      ＋
+                    </button>
+                  </Show>
+                </div>
               </div>
 
               {/* Task リスト */}
-              <For each={op.tasks}>
+              <For
+                each={
+                  showHidden()
+                    ? op.tasks
+                    : op.tasks.filter((t) => !t.hidden)
+                }
+              >
                 {(task) => {
                   const isActive = () => activeInfo().task_id === task.id;
                   // このタスクのグローバルインデックスを都度計算
@@ -379,35 +486,80 @@ function App() {
                     focusedTaskIndex() === globalIdx();
 
                   return (
-                    <button
+                    <div
                       data-task-id={task.id}
-                      onClick={() => {
-                        setFocusedTaskIndex(-1);
-                        handleStartTask(task.id);
-                      }}
-                      class={`w-full flex items-center justify-between px-3 py-2 text-left border-t border-gray-700 transition-colors ${
-                        isActive()
-                          ? "bg-blue-950 text-blue-300"
-                          : isFocused()
-                            ? "bg-gray-700 text-white ring-2 ring-inset ring-blue-400"
-                            : "bg-gray-800 hover:bg-gray-700 text-gray-300"
+                      class={`w-full flex items-center px-3 py-2 border-t border-gray-700 transition-colors gap-1 ${
+                        task.hidden
+                          ? "bg-gray-900 opacity-60"
+                          : isActive()
+                            ? "bg-blue-950 text-blue-300"
+                            : isFocused()
+                              ? "bg-gray-700 text-white ring-2 ring-inset ring-blue-400"
+                              : "bg-gray-800 text-gray-300"
                       }`}
                     >
-                      <span class="truncate">{task.name}</span>
-                      <div class="flex items-center gap-1.5 shrink-0 ml-2">
+                      {/* タスク名エリア: クリックで計測開始 */}
+                      <div
+                        onClick={() => {
+                          if (!task.hidden) {
+                            setFocusedTaskIndex(-1);
+                            handleStartTask(task.id);
+                          }
+                        }}
+                        class={`flex-1 min-w-0 flex items-center gap-1.5 ${
+                          !task.hidden
+                            ? "cursor-pointer hover:text-white"
+                            : "cursor-default"
+                        }`}
+                      >
+                        <span class="truncate">{task.name}</span>
                         <Show when={task.tag}>
                           <span class="text-xs px-1.5 py-0.5 rounded bg-gray-700 text-gray-400">
                             {task.tag}
                           </span>
                         </Show>
-                        {/* Tab ナビゲーション中のフォーカスインジケーター */}
                         <Show when={isFocused()}>
-                          <span class="text-blue-400 text-xs font-bold">
-                            ↵
-                          </span>
+                          <span class="text-blue-400 text-xs font-bold">↵</span>
                         </Show>
                       </div>
-                    </button>
+
+                      {/* 操作ボタン群 */}
+                      <div class="flex items-center gap-0.5 shrink-0">
+                        <button
+                          onClick={() =>
+                            handleReorderTask(op.id, task.id, "up")
+                          }
+                          disabled={op.tasks[0]?.id === task.id}
+                          title="上に移動"
+                          class={`${ctrlBtn} text-gray-600 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed`}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          onClick={() =>
+                            handleReorderTask(op.id, task.id, "down")
+                          }
+                          disabled={
+                            op.tasks[op.tasks.length - 1]?.id === task.id
+                          }
+                          title="下に移動"
+                          class={`${ctrlBtn} text-gray-600 hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed`}
+                        >
+                          ↓
+                        </button>
+                        <button
+                          onClick={() => handleToggleTaskVisibility(task.id)}
+                          title={task.hidden ? "再表示する" : "非表示にする"}
+                          class={`${ctrlBtn} ${
+                            task.hidden
+                              ? "text-orange-400 hover:text-orange-300"
+                              : "text-gray-600 hover:text-gray-300"
+                          }`}
+                        >
+                          👁
+                        </button>
+                      </div>
+                    </div>
                   );
                 }}
               </For>

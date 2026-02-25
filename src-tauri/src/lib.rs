@@ -23,6 +23,8 @@ pub struct Task {
     pub name: String,
     pub tag: String,
     pub time_logs: Vec<TimeLog>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -31,6 +33,8 @@ pub struct Operation {
     pub name: String,
     pub description: String,
     pub tasks: Vec<Task>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -258,6 +262,7 @@ fn add_operation(
         name,
         description,
         tasks: vec![],
+        hidden: false,
     });
     save_data(&app, &data)?;
     Ok(id)
@@ -284,9 +289,94 @@ fn add_task(
         name,
         tag,
         time_logs: vec![],
+        hidden: false,
     });
     save_data(&app, &data)?;
     Ok(id)
+}
+
+/// オペレーションの順序を変更する（隣接要素とスワップ）
+#[tauri::command]
+fn reorder_operation(
+    app: AppHandle,
+    op_id: String,
+    direction: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut data = state.data.lock().unwrap();
+    let ops = &mut data.operations;
+    let idx = ops
+        .iter()
+        .position(|o| o.id == op_id)
+        .ok_or_else(|| format!("オペレーション '{}' が見つかりません", op_id))?;
+    match direction.as_str() {
+        "up" if idx > 0 => ops.swap(idx, idx - 1),
+        "down" if idx + 1 < ops.len() => ops.swap(idx, idx + 1),
+        _ => {}
+    }
+    save_data(&app, &data)
+}
+
+/// タスクの順序を変更する（隣接要素とスワップ）
+#[tauri::command]
+fn reorder_task(
+    app: AppHandle,
+    op_id: String,
+    task_id: String,
+    direction: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut data = state.data.lock().unwrap();
+    let op = data
+        .operations
+        .iter_mut()
+        .find(|o| o.id == op_id)
+        .ok_or_else(|| format!("オペレーション '{}' が見つかりません", op_id))?;
+    let idx = op
+        .tasks
+        .iter()
+        .position(|t| t.id == task_id)
+        .ok_or_else(|| format!("タスク '{}' が見つかりません", task_id))?;
+    match direction.as_str() {
+        "up" if idx > 0 => op.tasks.swap(idx, idx - 1),
+        "down" if idx + 1 < op.tasks.len() => op.tasks.swap(idx, idx + 1),
+        _ => {}
+    }
+    save_data(&app, &data)
+}
+
+/// オペレーションの表示/非表示を切り替える
+#[tauri::command]
+fn toggle_operation_visibility(
+    app: AppHandle,
+    op_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut data = state.data.lock().unwrap();
+    let op = data
+        .operations
+        .iter_mut()
+        .find(|o| o.id == op_id)
+        .ok_or_else(|| format!("オペレーション '{}' が見つかりません", op_id))?;
+    op.hidden = !op.hidden;
+    save_data(&app, &data)
+}
+
+/// タスクの表示/非表示を切り替える
+#[tauri::command]
+fn toggle_task_visibility(
+    app: AppHandle,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut data = state.data.lock().unwrap();
+    for op in &mut data.operations {
+        if let Some(task) = op.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.hidden = !task.hidden;
+            return save_data(&app, &data);
+        }
+    }
+    Err(format!("タスク '{}' が見つかりません", task_id))
 }
 
 /// 全タイムログを CSV に書き出してパスを返す
@@ -356,8 +446,6 @@ fn set_always_on_top(app: AppHandle, value: bool) -> Result<(), String> {
 }
 
 /// カスタムタイトルバーからのドラッグ開始
-/// data-tauri-drag-region は Linux で動作しない環境があるため、
-/// mousedown イベントから明示的に呼び出す方式に変更
 #[tauri::command]
 fn start_dragging(app: AppHandle) -> Result<(), String> {
     app.get_webview_window("main")
@@ -410,6 +498,10 @@ pub fn run() {
             export_csv,
             set_always_on_top,
             start_dragging,
+            reorder_operation,
+            reorder_task,
+            toggle_operation_visibility,
+            toggle_task_visibility,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
