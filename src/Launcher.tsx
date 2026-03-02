@@ -23,6 +23,7 @@ function Launcher() {
   const [loading, setLoading] = createSignal(false);
 
   let unlistenShow: (() => void) | undefined;
+  let rootRef: HTMLDivElement | undefined;
 
   // ============================================================
   // ウィンドウ操作
@@ -111,10 +112,12 @@ function Launcher() {
       setLoading(false);
 
       // 3. SolidJS の DOM 更新が完了したフレームで Rust 経由で show + focus
-      //    win.show() だけではフォーカスが移らず Enter 等が届かないため
-      //    show_launcher_self コマンドで show() と set_focus() を同時に実行する
-      requestAnimationFrame(() => {
-        invoke("show_launcher_self").catch(console.error);
+      //    win.show() + win.set_focus() で OS レベルのフォーカスを取得し、
+      //    その後 rootRef.focus() で JS ドキュメントレベルのフォーカスを付与する。
+      //    JS フォーカスがないと document の keydown リスナーが発火しない。
+      requestAnimationFrame(async () => {
+        await invoke("show_launcher_self");
+        rootRef?.focus();
       });
     });
   });
@@ -130,8 +133,11 @@ function Launcher() {
 
   return (
     // 全画面半透明オーバーレイ。背景クリックで閉じる
+    // tabindex="-1" を付与して JS レベルの focus() 呼び出しを受け取れるようにする
     <div
-      class="w-screen h-screen flex items-center justify-center"
+      ref={rootRef}
+      tabindex="-1"
+      class="w-screen h-screen flex items-center justify-center outline-none"
       style="background-color: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
       onClick={closeSelf}
     >
