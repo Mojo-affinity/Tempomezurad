@@ -182,11 +182,14 @@ fn stop_task_inner(app: &AppHandle) -> Result<(), String> {
 // ============================================================
 
 fn show_launcher_window(app: &AppHandle) {
-    // "show-launcher" イベントをランチャーウィンドウに送信する。
-    // ランチャーはイベントを受けてタスクリストを更新し、
-    // DOM 反映後にフロントエンド側から自身を show() する。
-    // (tauri.conf.json で visible:false の常駐ウィンドウとして起動済み)
+    // 1. 先に show() + set_focus() でウィンドウを可視化・OS フォーカスを付与する。
+    //    hidden な WebView へのイベント送信は到達が不安定なため、
+    //    表示してから emit することで JS が確実にイベントを受け取れるようにする。
+    // 2. emit("show-launcher") を受けた JS 側がタスクを取得し、
+    //    rootRef.focus() で JS ドキュメントレベルのフォーカスを完成させる。
     if let Some(win) = app.get_webview_window("launcher") {
+        let _ = win.show();
+        let _ = win.set_focus();
         let _ = win.emit("show-launcher", ());
     }
 }

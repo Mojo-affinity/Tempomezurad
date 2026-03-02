@@ -95,38 +95,32 @@ function Launcher() {
 
   // ============================================================
   // 初期化:
-  //   "show-launcher" イベントを待ち受ける。
-  //   イベント受信 → タスク取得 → DOM 反映 → win.show() の順で実行する。
-  //   これにより、ウィンドウが表示される時点で必ずコンテンツが揃っており
-  //   白フラッシュが発生しない。
+  //   Rust 側が show() + set_focus() を済ませた後に "show-launcher" を emit する。
+  //   JS はイベント受信後にタスクを取得し rootRef.focus() で JS フォーカスを完成させる。
   // ============================================================
 
   onMount(async () => {
-    document.addEventListener("keydown", handleKeyDown);
-
+    // Rust 側ですでに show() + set_focus() を実行済みのため、
+    // ここではタスク取得と JS ドキュメントレベルのフォーカス付与のみ行う。
     unlistenShow = await listen("show-launcher", async () => {
       // 1. フォーカスをリセット
       setFocusedIndex(0);
 
-      // 2. タスクリストを最新化（ウィンドウはまだ非表示）
+      // 2. タスクリストを最新化
       setLoading(true);
       const fresh = await invoke<RecentTaskInfo[]>("get_recent_tasks");
       setTasks(fresh);
       setLoading(false);
 
-      // 3. SolidJS の DOM 更新が完了したフレームで Rust 経由で show + focus
-      //    win.show() + win.set_focus() で OS レベルのフォーカスを取得し、
-      //    その後 rootRef.focus() で JS ドキュメントレベルのフォーカスを付与する。
-      //    JS フォーカスがないと document の keydown リスナーが発火しない。
-      requestAnimationFrame(async () => {
-        await invoke("show_launcher_self");
+      // 3. rootRef に JS フォーカスを付与することで onKeyDown が発火するようにする。
+      //    requestAnimationFrame で SolidJS の DOM 更新を待つ。
+      requestAnimationFrame(() => {
         rootRef?.focus();
       });
     });
   });
 
   onCleanup(() => {
-    document.removeEventListener("keydown", handleKeyDown);
     unlistenShow?.();
   });
 
@@ -134,15 +128,16 @@ function Launcher() {
   // UI
   // ============================================================
 
+  // tabindex="-1": focus() で JS フォーカスを受け取れる
+  // onKeyDown: document.addEventListener より確実。フォーカス済み要素に直接バインド
   return (
-    // 全画面半透明オーバーレイ。背景クリックで閉じる
-    // tabindex="-1" を付与して JS レベルの focus() 呼び出しを受け取れるようにする
     <div
       ref={rootRef}
       tabindex="-1"
       class="w-screen h-screen flex items-center justify-center outline-none"
       style="background-color: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
       onClick={closeSelf}
+      onKeyDown={handleKeyDown}
     >
       {/* モーダルパネル。クリック伝播を止める */}
       <div
