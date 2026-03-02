@@ -78,6 +78,8 @@ pub struct ActiveTaskInfo {
 pub struct AppStateView {
     pub operations: Vec<Operation>,
     pub active: ActiveTaskInfo,
+    /// task_id -> 当日の合計計測秒数（実行中セッションを含む）
+    pub today_seconds: HashMap<String, i64>,
 }
 
 /// ランチャーに渡す「最近使ったタスク」情報
@@ -195,7 +197,19 @@ fn show_launcher_window(app: &AppHandle) {
 
 /// 現在の全状態を返す
 #[tauri::command]
-fn get_state(state: State<'_, AppState>) -> AppStateView {
+fn get_state(app: AppHandle, state: State<'_, AppState>) -> AppStateView {
+    let now = Local::now();
+
+    // 今日の日別ログからタスクごとの合計秒数を集計（ロック取得前に I/O を完了させる）
+    let daily_log = load_daily_log(&app, now.date_naive());
+    let mut today_seconds: HashMap<String, i64> = HashMap::new();
+    for log in &daily_log.logs {
+        // end_time が None（実行中）は現在時刻を終端として積算する
+        let end = log.end_time.unwrap_or(now);
+        let secs = (end - log.start_time).num_seconds().max(0);
+        *today_seconds.entry(log.task_id.clone()).or_insert(0) += secs;
+    }
+
     let data = state.data.lock().unwrap();
     let active_task_id = state.active_task_id.lock().unwrap().clone();
     let active_task_start = state.active_task_start.lock().unwrap().clone();
@@ -210,7 +224,7 @@ fn get_state(state: State<'_, AppState>) -> AppStateView {
                 break;
             }
         }
-        let elapsed_seconds = active_task_start.map(|start| (Local::now() - start).num_seconds());
+        let elapsed_seconds = active_task_start.map(|start| (now - start).num_seconds());
         ActiveTaskInfo {
             task_id: Some(task_id.clone()),
             task_name,
@@ -229,6 +243,7 @@ fn get_state(state: State<'_, AppState>) -> AppStateView {
     AppStateView {
         operations: data.operations.clone(),
         active,
+        today_seconds,
     }
 }
 

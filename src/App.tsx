@@ -31,6 +31,7 @@ interface ActiveTaskInfo {
 interface AppStateView {
   operations: Operation[];
   active: ActiveTaskInfo;
+  today_seconds: Record<string, number>;
 }
 
 // ============================================================
@@ -42,6 +43,15 @@ function formatSeconds(total: number): string {
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+/** 当日合計時間の短縮表示 (例: 3h 12m / 45m / 30s) */
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m`;
+  return `${m}m`;
 }
 
 // ============================================================
@@ -58,6 +68,7 @@ function App() {
     elapsed_seconds: null,
   });
   const [elapsedSeconds, setElapsedSeconds] = createSignal(0);
+  const [todaySeconds, setTodaySeconds] = createSignal<Record<string, number>>({});
 
   // --- ピン / エクスポート ---
   const [pinned, setPinned] = createSignal(false);
@@ -117,6 +128,7 @@ function App() {
     setActiveInfo(state.active);
     // タイマーの基点を Rust の elapsed_seconds で上書き (絶対ルール: Rust が SSOT)
     setElapsedSeconds(state.active.elapsed_seconds ?? 0);
+    setTodaySeconds(state.today_seconds);
   };
 
   // 1 秒ごとにカウントアップ (表示のみ)
@@ -549,6 +561,17 @@ function App() {
                           <span class="text-blue-400 text-xs font-bold">↵</span>
                         </Show>
                       </div>
+
+                      {/* 当日合計時間 */}
+                      <Show when={(todaySeconds()[task.id] ?? 0) > 0}>
+                        <span
+                          class={`text-xs tabular-nums shrink-0 ${
+                            isActive() ? "text-blue-400" : "text-gray-500"
+                          }`}
+                        >
+                          {formatDuration(todaySeconds()[task.id] ?? 0)}
+                        </span>
+                      </Show>
 
                       {/* 操作ボタン群 */}
                       <div class="flex items-center gap-0.5 shrink-0">
