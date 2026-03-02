@@ -36,7 +36,8 @@ function Launcher() {
 
   const selectTask = async (taskId: string) => {
     try {
-      await invoke("start_task", { taskId });
+      // Rust 側のパラメータ名 task_id (snake_case) と明示的に対応させる
+      await invoke("start_task", { task_id: taskId });
     } catch (e) {
       console.error("start_task エラー:", e);
     }
@@ -70,6 +71,8 @@ function Launcher() {
         scrollFocused();
         break;
       case "Enter": {
+        // IME 確定エンターを無視する
+        if (e.isComposing) return;
         e.preventDefault();
         const t = ts[focusedIndex()];
         if (t) selectTask(t.task_id);
