@@ -180,26 +180,13 @@ fn stop_task_inner(app: &AppHandle) -> Result<(), String> {
 // ============================================================
 
 fn show_launcher_window(app: &AppHandle) {
-    // 既にランチャーウィンドウが存在する場合はフォーカスのみ
+    // "show-launcher" イベントをランチャーウィンドウに送信する。
+    // ランチャーはイベントを受けてタスクリストを更新し、
+    // DOM 反映後にフロントエンド側から自身を show() する。
+    // (tauri.conf.json で visible:false の常駐ウィンドウとして起動済み)
     if let Some(win) = app.get_webview_window("launcher") {
-        let _ = win.show();
-        let _ = win.set_focus();
-        return;
+        let _ = win.emit("show-launcher", ());
     }
-
-    // 透明・全画面・常時最前面のランチャーウィンドウを動的生成
-    let _ = tauri::WebviewWindowBuilder::new(
-        app,
-        "launcher",
-        tauri::WebviewUrl::App(std::path::PathBuf::from("/")),
-    )
-    .transparent(true)
-    .fullscreen(true)
-    .always_on_top(true)
-    .decorations(false)
-    .skip_taskbar(true)
-    .focused(true)
-    .build();
 }
 
 // ============================================================
@@ -422,11 +409,11 @@ fn stop_active_task(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// ランチャーウィンドウを閉じる
+/// ランチャーウィンドウを非表示にする（close ではなく hide で常駐維持）
 #[tauri::command]
 fn close_launcher(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("launcher") {
-        win.close().map_err(|e| e.to_string())?;
+        win.hide().map_err(|e| e.to_string())?;
     }
     Ok(())
 }

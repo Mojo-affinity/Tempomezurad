@@ -18,6 +18,15 @@
         "resizable": true,
         "decorations": false,
         "alwaysOnTop": false
+      },
+      {
+        "label": "launcher",
+        "visible": false,
+        "transparent": true,
+        "fullscreen": true,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "skipTaskbar": true
       }
     ],
     "security": {

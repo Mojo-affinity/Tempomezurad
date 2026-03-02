@@ -1,5 +1,7 @@
 import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 // ============================================================
 // 型定義
@@ -17,27 +19,20 @@ interface RecentTaskInfo {
 // ============================================================
 
 function Launcher() {
+  const win = getCurrentWebviewWindow();
+
   const [tasks, setTasks] = createSignal<RecentTaskInfo[]>([]);
   const [focusedIndex, setFocusedIndex] = createSignal(0);
-  const [loading, setLoading] = createSignal(true);
+  const [loading, setLoading] = createSignal(false);
 
-  // ウィンドウ背景を透明にする（Tauri の transparent フラグと合わせて機能する）
-  onMount(() => {
-    document.documentElement.style.background = "transparent";
-    document.body.style.background = "transparent";
-  });
+  let unlistenShow: (() => void) | undefined;
 
-  // 最近使ったタスク一覧を取得
-  onMount(async () => {
-    try {
-      const recent = await invoke<RecentTaskInfo[]>("get_recent_tasks");
-      setTasks(recent);
-    } finally {
-      setLoading(false);
-    }
-  });
+  // ============================================================
+  // ウィンドウ操作
+  // ============================================================
 
   const closeSelf = () => {
+    // hide() で常駐維持（close() しない）
     invoke("close_launcher").catch(console.error);
   };
 
@@ -61,11 +56,9 @@ function Launcher() {
     switch (e.key) {
       case "Tab":
         e.preventDefault();
-        if (e.shiftKey) {
-          setFocusedIndex((i) => (i - 1 + ts.length) % ts.length);
-        } else {
-          setFocusedIndex((i) => (i + 1) % ts.length);
-        }
+        setFocusedIndex((i) =>
+          e.shiftKey ? (i - 1 + ts.length) % ts.length : (i + 1) % ts.length
+        );
         scrollFocused();
         break;
       case "ArrowDown":
@@ -99,15 +92,45 @@ function Launcher() {
     });
   };
 
-  onMount(() => document.addEventListener("keydown", handleKeyDown));
-  onCleanup(() => document.removeEventListener("keydown", handleKeyDown));
+  // ============================================================
+  // 初期化:
+  //   "show-launcher" イベントを待ち受ける。
+  //   イベント受信 → タスク取得 → DOM 反映 → win.show() の順で実行する。
+  //   これにより、ウィンドウが表示される時点で必ずコンテンツが揃っており
+  //   白フラッシュが発生しない。
+  // ============================================================
+
+  onMount(async () => {
+    document.addEventListener("keydown", handleKeyDown);
+
+    unlistenShow = await listen("show-launcher", async () => {
+      // 1. フォーカスをリセット
+      setFocusedIndex(0);
+
+      // 2. タスクリストを最新化（ウィンドウはまだ非表示）
+      setLoading(true);
+      const fresh = await invoke<RecentTaskInfo[]>("get_recent_tasks");
+      setTasks(fresh);
+      setLoading(false);
+
+      // 3. SolidJS の DOM 更新が完了したフレームでウィンドウを表示
+      requestAnimationFrame(() => {
+        win.show().catch(console.error);
+      });
+    });
+  });
+
+  onCleanup(() => {
+    document.removeEventListener("keydown", handleKeyDown);
+    unlistenShow?.();
+  });
 
   // ============================================================
   // UI
   // ============================================================
 
   return (
-    // 全画面半透明オーバーレイ。クリックで閉じる
+    // 全画面半透明オーバーレイ。背景クリックで閉じる
     <div
       class="w-screen h-screen flex items-center justify-center"
       style="background-color: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
