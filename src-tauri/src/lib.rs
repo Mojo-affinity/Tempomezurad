@@ -409,6 +409,18 @@ fn stop_active_task(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// ランチャーを表示してキーボードフォーカスを当てる（フロントエンド主導の show 用）
+/// show() だけではフォーカスが移らず Enter 等のキーイベントが届かないため、
+/// set_focus() も合わせて Rust 側で実行する。
+#[tauri::command]
+fn show_launcher_self(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("launcher") {
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// ランチャーウィンドウを非表示にする（close ではなく hide で常駐維持）
 #[tauri::command]
 fn close_launcher(app: AppHandle) -> Result<(), String> {
@@ -688,6 +700,7 @@ pub fn run() {
             get_recent_tasks,
             start_task,
             stop_active_task,
+            show_launcher_self,
             close_launcher,
             add_operation,
             add_task,

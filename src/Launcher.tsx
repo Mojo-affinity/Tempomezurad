@@ -1,7 +1,6 @@
 import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 // ============================================================
 // 型定義
@@ -19,8 +18,6 @@ interface RecentTaskInfo {
 // ============================================================
 
 function Launcher() {
-  const win = getCurrentWebviewWindow();
-
   const [tasks, setTasks] = createSignal<RecentTaskInfo[]>([]);
   const [focusedIndex, setFocusedIndex] = createSignal(0);
   const [loading, setLoading] = createSignal(false);
@@ -113,9 +110,11 @@ function Launcher() {
       setTasks(fresh);
       setLoading(false);
 
-      // 3. SolidJS の DOM 更新が完了したフレームでウィンドウを表示
+      // 3. SolidJS の DOM 更新が完了したフレームで Rust 経由で show + focus
+      //    win.show() だけではフォーカスが移らず Enter 等が届かないため
+      //    show_launcher_self コマンドで show() と set_focus() を同時に実行する
       requestAnimationFrame(() => {
-        win.show().catch(console.error);
+        invoke("show_launcher_self").catch(console.error);
       });
     });
   });
