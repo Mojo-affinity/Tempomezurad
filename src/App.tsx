@@ -6,16 +6,10 @@ import { listen } from "@tauri-apps/api/event";
 // 型定義 (Rust の AppStateView に対応)
 // ============================================================
 
-interface TimeLog {
-  start_time: string;
-  end_time: string | null;
-}
-
 interface Task {
   id: string;
   name: string;
   tag: string;
-  time_logs: TimeLog[];
   hidden: boolean;
 }
 
@@ -82,14 +76,32 @@ function App() {
   const [taskName, setTaskName] = createSignal("");
   const [taskTag, setTaskTag] = createSignal("");
 
+  // --- アコーディオン: 折り畳まれているオペレーション ID のセット ---
+  const [collapsedOps, setCollapsedOps] = createSignal<Set<string>>(new Set());
+
+  const toggleCollapse = (opId: string) => {
+    setCollapsedOps((prev) => {
+      const next = new Set(prev);
+      if (next.has(opId)) {
+        next.delete(opId);
+      } else {
+        next.add(opId);
+      }
+      return next;
+    });
+  };
+
+  const isCollapsed = (opId: string) => collapsedOps().has(opId);
+
   // --- Tab キーナビゲーション: 現在フォーカス中のタスクのフラットインデックス (-1 = 非アクティブ) ---
   const [focusedTaskIndex, setFocusedTaskIndex] = createSignal(-1);
 
-  // 表示中のタスク ID をフラットに列挙 (Tab ナビ用)
+  // 表示中かつ折り畳まれていないタスク ID をフラットに列挙 (Tab ナビ用)
   const flatTaskIds = (): string[] => {
     const ids: string[] = [];
     for (const op of operations()) {
       if (op.hidden && !showHidden()) continue;
+      if (isCollapsed(op.id)) continue;
       for (const task of op.tasks) {
         if (task.hidden && !showHidden()) continue;
         ids.push(task.id);
@@ -274,23 +286,14 @@ function App() {
     }
   };
 
-  // --- グローバルショートカット (Ctrl+Shift+Space) で Rust がウィンドウをフォーカス → イベント受信 ---
-  let unlistenWindowActivated: (() => void) | undefined;
+  // ランチャーや他ウィンドウから start_task/stop_active_task が呼ばれた際の自動 sync
+  let unlistenStateChanged: (() => void) | undefined;
 
   onMount(async () => {
     await syncState();
 
-    unlistenWindowActivated = await listen("window-activated", async () => {
+    unlistenStateChanged = await listen("state-changed", async () => {
       await syncState();
-      const ids = flatTaskIds();
-      setFocusedTaskIndex(ids.length > 0 ? 0 : -1);
-      requestAnimationFrame(() => {
-        if (ids.length > 0) {
-          document
-            .querySelector(`[data-task-id="${ids[0]}"]`)
-            ?.scrollIntoView({ block: "nearest" });
-        }
-      });
     });
 
     document.addEventListener("keydown", handleKeyDown);
@@ -298,7 +301,7 @@ function App() {
 
   onCleanup(() => {
     clearInterval(timer);
-    unlistenWindowActivated?.();
+    unlistenStateChanged?.();
     document.removeEventListener("keydown", handleKeyDown);
   });
 
@@ -424,15 +427,24 @@ function App() {
             >
               {/* Operation ヘッダー */}
               <div class="flex items-center justify-between px-3 py-2 bg-gray-700">
-                <div class="min-w-0 flex-1">
-                  <span class="font-semibold text-gray-200 truncate block">
-                    {op.name}
+                {/* 折り畳みトグル + タイトル */}
+                <div
+                  class="min-w-0 flex-1 flex items-start gap-1.5 cursor-pointer select-none"
+                  onClick={() => toggleCollapse(op.id)}
+                >
+                  <span class="text-gray-400 text-xs mt-0.5 shrink-0 w-3 text-center">
+                    {isCollapsed(op.id) ? "▶" : "▼"}
                   </span>
-                  <Show when={op.description}>
-                    <span class="text-gray-500 text-xs truncate block">
-                      {op.description}
+                  <div class="min-w-0">
+                    <span class="font-semibold text-gray-200 truncate block">
+                      {op.name}
                     </span>
-                  </Show>
+                    <Show when={op.description}>
+                      <span class="text-gray-500 text-xs truncate block">
+                        {op.description}
+                      </span>
+                    </Show>
+                  </div>
                 </div>
 
                 {/* 操作ボタン群 */}
@@ -483,7 +495,8 @@ function App() {
                 </div>
               </div>
 
-              {/* Task リスト */}
+              {/* Task リスト (折り畳み中は非表示) */}
+              <Show when={!isCollapsed(op.id)}>
               <For
                 each={
                   showHidden()
@@ -577,6 +590,7 @@ function App() {
                   );
                 }}
               </For>
+              </Show>
 
               {/* タスク追加フォーム */}
               <Show when={addTaskForOpId() === op.id}>
