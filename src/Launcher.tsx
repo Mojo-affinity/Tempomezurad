@@ -1,10 +1,14 @@
-import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
+import {
+  For,
+  Show,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-
-// ============================================================
-// 型定義
-// ============================================================
+import { Icon } from "./Icons";
 
 interface RecentTaskInfo {
   task_id: string;
@@ -13,104 +17,94 @@ interface RecentTaskInfo {
   tag: string;
 }
 
-// ============================================================
-// ランチャーコンポーネント
-// ============================================================
-
 function Launcher() {
   const [tasks, setTasks] = createSignal<RecentTaskInfo[]>([]);
+  const [query, setQuery] = createSignal("");
   const [focusedIndex, setFocusedIndex] = createSignal(0);
   const [loading, setLoading] = createSignal(false);
-
+  let searchInput: HTMLInputElement | undefined;
   let unlistenShow: (() => void) | undefined;
 
-  // ============================================================
-  // ウィンドウ操作
-  // ============================================================
+  const filteredTasks = createMemo(() => {
+    const normalized = query().trim().toLocaleLowerCase();
+    if (!normalized) return tasks();
+    return tasks().filter((task) =>
+      [task.task_name, task.operation_name, task.tag].some((value) =>
+        value.toLocaleLowerCase().includes(normalized),
+      ),
+    );
+  });
 
   const closeSelf = () => {
-    // hide() で常駐維持（close() しない）
     invoke("close_launcher").catch(console.error);
   };
 
   const selectTask = async (taskId: string) => {
     try {
-      // Rust 側のパラメータ名 task_id (snake_case) と明示的に対応させる
       await invoke("start_task", { task_id: taskId });
-    } catch (e) {
-      console.error("start_task エラー:", e);
+    } catch (error) {
+      console.error("タスクを開始できませんでした", error);
     }
     closeSelf();
   };
 
-  // ============================================================
-  // キーボードナビゲーション
-  // ============================================================
+  const scrollFocused = (index: number) => {
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-launcher-index="${index}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  };
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    const ts = tasks();
-    if (ts.length === 0) return;
+  const moveFocus = (direction: 1 | -1) => {
+    const count = filteredTasks().length;
+    if (!count) return;
+    const next = (focusedIndex() + direction + count) % count;
+    setFocusedIndex(next);
+    scrollFocused(next);
+  };
 
-    switch (e.key) {
+  const handleKeyDown = (event: KeyboardEvent) => {
+    const currentTasks = filteredTasks();
+    switch (event.key) {
       case "Tab":
-        e.preventDefault();
-        setFocusedIndex((i) =>
-          e.shiftKey ? (i - 1 + ts.length) % ts.length : (i + 1) % ts.length
-        );
-        scrollFocused();
-        break;
       case "ArrowDown":
-        e.preventDefault();
-        setFocusedIndex((i) => (i + 1) % ts.length);
-        scrollFocused();
+        event.preventDefault();
+        moveFocus(event.shiftKey ? -1 : 1);
         break;
       case "ArrowUp":
-        e.preventDefault();
-        setFocusedIndex((i) => (i - 1 + ts.length) % ts.length);
-        scrollFocused();
+        event.preventDefault();
+        moveFocus(-1);
         break;
       case "Enter": {
-        // IME 確定エンターを無視する
-        if (e.isComposing) return;
-        e.preventDefault();
-        const t = ts[focusedIndex()];
-        if (t) selectTask(t.task_id);
+        if (event.isComposing) return;
+        event.preventDefault();
+        const task = currentTasks[focusedIndex()];
+        if (task) void selectTask(task.task_id);
         break;
       }
       case "Escape":
-        e.preventDefault();
+        event.preventDefault();
         closeSelf();
         break;
     }
   };
 
-  const scrollFocused = () => {
-    requestAnimationFrame(() => {
-      document
-        .querySelector(`[data-launcher-index="${focusedIndex()}"]`)
-        ?.scrollIntoView({ block: "nearest" });
-    });
+  const refreshTasks = async () => {
+    setFocusedIndex(0);
+    setQuery("");
+    setLoading(true);
+    try {
+      setTasks(await invoke<RecentTaskInfo[]>("get_recent_tasks"));
+    } finally {
+      setLoading(false);
+      requestAnimationFrame(() => searchInput?.focus());
+    }
   };
 
-  // ============================================================
-  // 初期化:
-  //   document レベルでキーイベントを捕捉し、div フォーカスに依存しない実装にする。
-  //   Rust 側が show() + set_focus() + emit("show-launcher") を行い、
-  //   JS はイベント受信後にタスクを最新化するだけでよい。
-  // ============================================================
-
   onMount(async () => {
-    // document レベルでキーイベントを捕捉する。
-    // div フォーカスに依存しないため、OS がウィンドウフォーカスを付与すれば確実に動作する。
     document.addEventListener("keydown", handleKeyDown);
-
-    unlistenShow = await listen("show-launcher", async () => {
-      setFocusedIndex(0);
-      setLoading(true);
-      const fresh = await invoke<RecentTaskInfo[]>("get_recent_tasks");
-      setTasks(fresh);
-      setLoading(false);
-    });
+    unlistenShow = await listen("show-launcher", refreshTasks);
   });
 
   onCleanup(() => {
@@ -118,96 +112,145 @@ function Launcher() {
     unlistenShow?.();
   });
 
-  // ============================================================
-  // UI
-  // ============================================================
-
   return (
-    <div
-      class="w-screen h-screen flex items-center justify-center outline-none"
-      style="background-color: rgba(0,0,0,0.6); backdrop-filter: blur(4px);"
-      onClick={closeSelf}
-    >
-      {/* モーダルパネル。クリック伝播を止める */}
-      <div
-        class="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl flex flex-col overflow-hidden"
-        style="width: 420px; max-height: 60vh;"
-        onClick={(e) => e.stopPropagation()}
+    <div class="launcher-overlay" onClick={closeSelf}>
+      <section
+        class="launcher-panel"
+        role="dialog"
+        aria-label="タスクランチャー"
+        onClick={(event) => event.stopPropagation()}
       >
-        {/* ヘッダー */}
-        <div class="px-4 py-2.5 border-b border-gray-700 bg-gray-800 flex items-center gap-2 shrink-0">
-          <span class="text-blue-400 text-xs font-mono font-bold tracking-wider">
-            TASK LAUNCHER
-          </span>
-          <span class="ml-auto text-gray-500 text-xs">
-            ↑↓ / Tab &nbsp;·&nbsp; Enter で開始 &nbsp;·&nbsp; Esc で閉じる
-          </span>
+        <header class="launcher-header">
+          <div class="flex min-w-0 items-center gap-3">
+            <div class="launcher-brand">
+              <Icon name="spark" size={17} />
+            </div>
+            <div class="min-w-0">
+              <p class="launcher-title">Quick switch</p>
+              <p class="launcher-subtitle">タスクを検索して計測を開始</p>
+            </div>
+          </div>
+          <button class="launcher-close" onClick={closeSelf} title="閉じる">
+            <Icon name="x" size={16} />
+          </button>
+        </header>
+
+        <div class="launcher-search-wrap">
+          <label class="launcher-search">
+            <Icon name="search" size={18} />
+            <input
+              ref={searchInput}
+              value={query()}
+              onInput={(event) => {
+                setQuery(event.currentTarget.value);
+                setFocusedIndex(0);
+              }}
+              placeholder="タスク、オペレーション、タグを検索"
+              autocomplete="off"
+              spellcheck={false}
+            />
+            <Show when={query()}>
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery("");
+                  setFocusedIndex(0);
+                  searchInput?.focus();
+                }}
+              >
+                <Icon name="x" size={14} />
+              </button>
+            </Show>
+          </label>
         </div>
 
-        {/* タスクリスト */}
-        <div class="overflow-y-auto flex-1">
+        <div class="launcher-meta">
+          <span>{query() ? "検索結果" : "最近使用したタスク"}</span>
+          <span>{filteredTasks().length} tasks</span>
+        </div>
+
+        <div class="launcher-list">
           <Show when={loading()}>
-            <p class="text-gray-500 text-xs text-center py-8">読み込み中…</p>
+            <div class="launcher-empty">
+              <span class="launcher-spinner" />
+              <p>タスクを読み込んでいます</p>
+            </div>
           </Show>
 
-          <Show when={!loading() && tasks().length === 0}>
-            <p class="text-gray-500 text-xs text-center py-8">
-              タスクがありません。メインウィンドウで追加してください。
-            </p>
+          <Show when={!loading() && filteredTasks().length === 0}>
+            <div class="launcher-empty">
+              <Icon name={query() ? "search" : "timer"} size={24} />
+              <p>
+                {query()
+                  ? "一致するタスクがありません"
+                  : "タスクがまだありません"}
+              </p>
+              <Show when={query()}>
+                <button
+                  onClick={() => {
+                    setQuery("");
+                    searchInput?.focus();
+                  }}
+                >
+                  検索をクリア
+                </button>
+              </Show>
+            </div>
           </Show>
 
-          <For each={tasks()}>
+          <For each={filteredTasks()}>
             {(task, index) => {
               const focused = () => focusedIndex() === index();
               return (
-                <div
+                <button
                   data-launcher-index={index()}
-                  class={`px-4 py-3 border-b border-gray-800 cursor-pointer transition-colors select-none ${
-                    focused()
-                      ? "bg-blue-700 text-white"
-                      : "text-gray-300 hover:bg-gray-800"
-                  }`}
+                  class={`launcher-task ${focused() ? "is-focused" : ""}`}
                   onClick={() => selectTask(task.task_id)}
                   onMouseEnter={() => setFocusedIndex(index())}
                 >
-                  <div class="flex items-center gap-2">
-                    <span
-                      class={`text-sm font-medium truncate ${
-                        focused() ? "text-white" : "text-gray-200"
-                      }`}
-                    >
-                      {task.task_name}
+                  <span class="launcher-task-icon">
+                    <Icon name="timer" size={17} />
+                  </span>
+                  <span class="min-w-0 flex-1 text-left">
+                    <span class="flex items-center gap-2">
+                      <span class="truncate text-sm font-semibold text-slate-100">
+                        {task.task_name}
+                      </span>
+                      <Show when={task.tag}>
+                        <span class="launcher-tag">{task.tag}</span>
+                      </Show>
                     </span>
-                    <Show when={task.tag}>
-                      <span
-                        class={`text-xs px-1.5 py-0.5 rounded shrink-0 ${
-                          focused()
-                            ? "bg-blue-600 text-blue-100"
-                            : "bg-gray-700 text-gray-400"
-                        }`}
-                      >
-                        {task.tag}
-                      </span>
-                    </Show>
+                    <span class="mt-1 block truncate text-[11px] text-slate-500">
+                      {task.operation_name}
+                    </span>
+                  </span>
+                  <span class="launcher-enter">
                     <Show when={focused()}>
-                      <span class="ml-auto text-blue-200 text-xs font-bold shrink-0">
-                        ↵
-                      </span>
+                      <span>開始</span>
+                      <kbd>↵</kbd>
                     </Show>
-                  </div>
-                  <div
-                    class={`text-xs mt-0.5 ${
-                      focused() ? "text-blue-200" : "text-gray-500"
-                    }`}
-                  >
-                    {task.operation_name}
-                  </div>
-                </div>
+                  </span>
+                </button>
               );
             }}
           </For>
         </div>
-      </div>
+
+        <footer class="launcher-footer">
+          <span>
+            <kbd>↑</kbd> <kbd>↓</kbd>
+            <span>選択</span>
+          </span>
+          <span>
+            <kbd>Enter</kbd>
+            <span>開始</span>
+          </span>
+          <span>
+            <kbd>Esc</kbd>
+            <span>閉じる</span>
+          </span>
+        </footer>
+      </section>
     </div>
   );
 }
