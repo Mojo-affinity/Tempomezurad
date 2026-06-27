@@ -6,6 +6,8 @@ export type IconName =
   | "arrow-up"
   | "chevron-down"
   | "chevron-right"
+  | "chart"
+  | "clock"
   | "download"
   | "edit"
   | "eye"
@@ -16,6 +18,7 @@ export type IconName =
   | "spark"
   | "stop"
   | "timer"
+  | "trash"
   | "x";
 
 interface IconProps extends JSX.SvgSVGAttributes<SVGSVGElement> {
@@ -47,6 +50,20 @@ export function Icon(props: IconProps) {
     ),
     "chevron-down": <path d="m6 9 6 6 6-6" />,
     "chevron-right": <path d="m9 18 6-6-6-6" />,
+    chart: (
+      <>
+        <path d="M4 19V9" />
+        <path d="M10 19V5" />
+        <path d="M16 19v-7" />
+        <path d="M22 19H2" />
+      </>
+    ),
+    clock: (
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" />
+      </>
+    ),
     download: (
       <>
         <path d="M12 3v12" />
@@ -105,6 +122,15 @@ export function Icon(props: IconProps) {
         <circle cx="12" cy="13" r="8" />
         <path d="M12 9v4l2.5 2" />
         <path d="M9 2h6" />
+      </>
+    ),
+    trash: (
+      <>
+        <path d="M4 7h16" />
+        <path d="m9 7 .5-3h5l.5 3" />
+        <path d="m6 7 1 14h10l1-14" />
+        <path d="M10 11v6" />
+        <path d="M14 11v6" />
       </>
     ),
     x: (

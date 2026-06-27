@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Duration, Local, NaiveDate};
 use csv::Writer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -91,6 +91,20 @@ pub struct RecentTaskInfo {
     pub tag: String,
 }
 
+/// 履歴画面に返す、タスク情報で補完済みの計測ログ
+#[derive(Serialize, Clone)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub task_id: String,
+    pub task_name: String,
+    pub operation_name: String,
+    pub tag: String,
+    pub start_time: DateTime<Local>,
+    pub end_time: Option<DateTime<Local>>,
+    pub duration_seconds: Option<i64>,
+    pub is_active: bool,
+}
+
 // ============================================================
 // 永続化ヘルパー
 // ============================================================
@@ -148,6 +162,27 @@ fn save_daily_log(app: &AppHandle, date: NaiveDate, log: &DailyLog) -> Result<()
     fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+/// 完了ログと現在アクティブなログだけに、安全な計測秒数を与える。
+/// end_time のない孤立ログは None とし、現在時刻まで増え続けないようにする。
+fn measured_duration_seconds(
+    log: &TimeLog,
+    active_task_id: Option<&str>,
+    active_task_start: Option<&DateTime<Local>>,
+    now: DateTime<Local>,
+) -> Option<i64> {
+    let end = match log.end_time {
+        Some(end) => end,
+        None
+            if active_task_id == Some(log.task_id.as_str())
+                && active_task_start == Some(&log.start_time) =>
+        {
+            now
+        }
+        None => return None,
+    };
+    Some((end - log.start_time).num_seconds().max(0))
+}
+
 // ============================================================
 // 共通ヘルパー: アクティブタスク停止
 // ============================================================
@@ -159,16 +194,21 @@ fn stop_task_inner(app: &AppHandle) -> Result<(), String> {
     let mut active_task_start = state.active_task_start.lock().unwrap();
 
     if let Some(current_id) = active_task_id.clone() {
-        let today = now.date_naive();
-        let mut daily_log = load_daily_log(app, today);
+        // 日付をまたいだ場合も、開始日のログファイルを確実に閉じる。
+        let log_date = active_task_start
+            .as_ref()
+            .map(|start| start.date_naive())
+            .unwrap_or_else(|| now.date_naive());
+        let mut daily_log = load_daily_log(app, log_date);
         if let Some(log) = daily_log
             .logs
             .iter_mut()
+            .rev()
             .find(|l| l.task_id == current_id && l.end_time.is_none())
         {
             log.end_time = Some(now);
         }
-        save_daily_log(app, today, &daily_log)?;
+        save_daily_log(app, log_date, &daily_log)?;
     }
 
     *active_task_id = None;
@@ -202,20 +242,25 @@ fn show_launcher_window(app: &AppHandle) {
 #[tauri::command]
 fn get_state(app: AppHandle, state: State<'_, AppState>) -> AppStateView {
     let now = Local::now();
-
-    // 今日の日別ログからタスクごとの合計秒数を集計（ロック取得前に I/O を完了させる）
-    let daily_log = load_daily_log(&app, now.date_naive());
-    let mut today_seconds: HashMap<String, i64> = HashMap::new();
-    for log in &daily_log.logs {
-        // end_time が None（実行中）は現在時刻を終端として積算する
-        let end = log.end_time.unwrap_or(now);
-        let secs = (end - log.start_time).num_seconds().max(0);
-        *today_seconds.entry(log.task_id.clone()).or_insert(0) += secs;
-    }
-
     let data = state.data.lock().unwrap();
     let active_task_id = state.active_task_id.lock().unwrap().clone();
     let active_task_start = state.active_task_start.lock().unwrap().clone();
+
+    // 今日の日別ログからタスクごとの合計秒数を集計する。
+    // 未終了ログのうち「現在のアクティブログ」だけを now まで積算し、
+    // 過去の孤立ログが時間を増やし続けることを防ぐ。
+    let daily_log = load_daily_log(&app, now.date_naive());
+    let mut today_seconds: HashMap<String, i64> = HashMap::new();
+    for log in &daily_log.logs {
+        if let Some(seconds) = measured_duration_seconds(
+            log,
+            active_task_id.as_deref(),
+            active_task_start.as_ref(),
+            now,
+        ) {
+            *today_seconds.entry(log.task_id.clone()).or_insert(0) += seconds;
+        }
+    }
 
     let active = if let Some(ref task_id) = active_task_id {
         let mut task_name = None;
@@ -363,6 +408,152 @@ fn build_fallback_list(data: &MasterData) -> Vec<RecentTaskInfo> {
     result
 }
 
+/// 計測履歴を開始時刻の新しい順で返す。
+#[tauri::command]
+fn get_history(
+    app: AppHandle,
+    days: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<HistoryEntry>, String> {
+    let data = state.data.lock().unwrap().clone();
+    let active_task_id = state.active_task_id.lock().unwrap().clone();
+    let active_task_start = state.active_task_start.lock().unwrap().clone();
+    let now = Local::now();
+    let cutoff = days
+        .filter(|value| *value > 0)
+        .map(|value| now - Duration::days(value));
+
+    let mut task_map: HashMap<String, (String, String, String)> = HashMap::new();
+    for operation in &data.operations {
+        for task in &operation.tasks {
+            task_map.insert(
+                task.id.clone(),
+                (
+                    task.name.clone(),
+                    operation.name.clone(),
+                    task.tag.clone(),
+                ),
+            );
+        }
+    }
+
+    let logs_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("logs");
+    let mut history = Vec::new();
+
+    if logs_dir.exists() {
+        for entry in fs::read_dir(&logs_dir).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            let daily_log = match serde_json::from_str::<DailyLog>(&content) {
+                Ok(log) => log,
+                Err(_) => continue,
+            };
+
+            for log in daily_log.logs {
+                // 未終了ログは期間外でも必ず返し、ユーザーが見失わないようにする。
+                if log.end_time.is_some()
+                    && cutoff.is_some_and(|value| log.start_time < value)
+                {
+                    continue;
+                }
+                let is_active = active_task_id.as_ref() == Some(&log.task_id)
+                    && active_task_start.as_ref() == Some(&log.start_time);
+                let duration_seconds = measured_duration_seconds(
+                    &log,
+                    active_task_id.as_deref(),
+                    active_task_start.as_ref(),
+                    now,
+                );
+                let (task_name, operation_name, tag) = task_map
+                    .get(&log.task_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        (
+                            "(削除済みタスク)".to_string(),
+                            "(不明)".to_string(),
+                            String::new(),
+                        )
+                    });
+
+                history.push(HistoryEntry {
+                    id: format!("{}|{}", log.task_id, log.start_time.to_rfc3339()),
+                    task_id: log.task_id,
+                    task_name,
+                    operation_name,
+                    tag,
+                    start_time: log.start_time,
+                    end_time: log.end_time,
+                    duration_seconds,
+                    is_active,
+                });
+            }
+        }
+    }
+
+    history.sort_by(|left, right| right.start_time.cmp(&left.start_time));
+    Ok(history)
+}
+
+/// 未終了の孤立ログを、ユーザーが選んだ方法で解消する。
+#[tauri::command]
+fn resolve_unfinished_log(
+    app: AppHandle,
+    task_id: String,
+    start_time: String,
+    action: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let parsed_start = DateTime::parse_from_rfc3339(&start_time)
+        .map_err(|error| format!("開始時刻を解釈できません: {error}"))?
+        .with_timezone(&Local);
+
+    let active_task_id = state.active_task_id.lock().unwrap().clone();
+    let active_task_start = state.active_task_start.lock().unwrap().clone();
+    if active_task_id.as_ref() == Some(&task_id)
+        && active_task_start.as_ref() == Some(&parsed_start)
+    {
+        return Err("計測中のログは履歴から変更できません".to_string());
+    }
+
+    let log_date = parsed_start.date_naive();
+    let mut daily_log = load_daily_log(&app, log_date);
+    let index = daily_log
+        .logs
+        .iter()
+        .position(|log| {
+            log.task_id == task_id
+                && log.start_time == parsed_start
+                && log.end_time.is_none()
+        })
+        .ok_or_else(|| "対象の未終了ログが見つかりません".to_string())?;
+
+    match action.as_str() {
+        "discard" => {
+            daily_log.logs.remove(index);
+        }
+        "close_now" => {
+            let now = Local::now();
+            if now < parsed_start {
+                return Err("開始時刻より前には終了できません".to_string());
+            }
+            daily_log.logs[index].end_time = Some(now);
+        }
+        _ => return Err("未対応の解消方法です".to_string()),
+    }
+
+    save_daily_log(&app, log_date, &daily_log)?;
+    let _ = app.emit("history-changed", ());
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
 /// タスク計測を開始する（既存アクティブタスクがあれば自動終了）
 #[tauri::command]
 fn start_task(
@@ -384,22 +575,11 @@ fn start_task(
         }
     }
 
-    let mut active_task_id = state.active_task_id.lock().unwrap();
-    let mut active_task_start = state.active_task_start.lock().unwrap();
+    // 既存タスクは開始日側のログを閉じてから新しいセッションを作る。
+    stop_task_inner(&app)?;
 
     let today = now.date_naive();
     let mut daily_log = load_daily_log(&app, today);
-
-    // 既存アクティブタスクを終了
-    if let Some(current_id) = active_task_id.clone() {
-        if let Some(log) = daily_log
-            .logs
-            .iter_mut()
-            .find(|l| l.task_id == current_id && l.end_time.is_none())
-        {
-            log.end_time = Some(now);
-        }
-    }
 
     // 新しいログを追加
     daily_log.logs.push(TimeLog {
@@ -410,6 +590,8 @@ fn start_task(
 
     save_daily_log(&app, today, &daily_log)?;
 
+    let mut active_task_id = state.active_task_id.lock().unwrap();
+    let mut active_task_start = state.active_task_start.lock().unwrap();
     *active_task_id = Some(task_id);
     *active_task_start = Some(now);
 
@@ -493,6 +675,61 @@ fn add_task(
     });
     save_master(&app, &data)?;
     Ok(id)
+}
+
+/// オペレーションの名称と説明を更新する
+#[tauri::command]
+fn update_operation(
+    app: AppHandle,
+    op_id: String,
+    name: String,
+    description: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("オペレーション名を入力してください".to_string());
+    }
+
+    let mut data = state.data.lock().unwrap();
+    let operation = data
+        .operations
+        .iter_mut()
+        .find(|operation| operation.id == op_id)
+        .ok_or_else(|| format!("オペレーション '{}' が見つかりません", op_id))?;
+    operation.name = trimmed_name.to_string();
+    operation.description = description.trim().to_string();
+    save_master(&app, &data)?;
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
+/// タスクの名称とタグを更新する
+#[tauri::command]
+fn update_task(
+    app: AppHandle,
+    task_id: String,
+    name: String,
+    tag: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("タスク名を入力してください".to_string());
+    }
+
+    let mut data = state.data.lock().unwrap();
+    let task = data
+        .operations
+        .iter_mut()
+        .flat_map(|operation| operation.tasks.iter_mut())
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| format!("タスク '{}' が見つかりません", task_id))?;
+    task.name = trimmed_name.to_string();
+    task.tag = tag.trim().to_string();
+    save_master(&app, &data)?;
+    let _ = app.emit("state-changed", ());
+    Ok(())
 }
 
 /// オペレーションの順序を変更する（隣接要素とスワップ）
@@ -687,6 +924,14 @@ fn start_dragging(app: AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 必ず最初に登録し、二重起動によるショートカット競合を防ぐ。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(
             // グローバルショートカット: Ctrl+Shift+Space でランチャーを表示
@@ -698,12 +943,27 @@ pub fn run() {
                 })
                 .build(),
         )
+        .on_window_event(|window, event| {
+            // メインウィンドウが閉じられたときは、進行中ログを必ず確定する。
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                let _ = stop_task_inner(window.app_handle());
+            }
+        })
         .setup(|app| {
             let data = load_master(app.handle());
+            // 同日中のクラッシュ・強制終了で残った最新ログだけを復元する。
+            // 過去日の未終了ログは履歴画面でユーザーに判断してもらう。
+            let today_log = load_daily_log(app.handle(), Local::now().date_naive());
+            let recovered = today_log
+                .logs
+                .iter()
+                .rev()
+                .find(|log| log.end_time.is_none())
+                .cloned();
             app.manage(AppState {
                 data: Mutex::new(data),
-                active_task_id: Mutex::new(None),
-                active_task_start: Mutex::new(None),
+                active_task_id: Mutex::new(recovered.as_ref().map(|log| log.task_id.clone())),
+                active_task_start: Mutex::new(recovered.map(|log| log.start_time)),
             });
 
             // ショートカット登録 (失敗してもアプリは起動継続)
@@ -716,12 +976,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             get_recent_tasks,
+            get_history,
+            resolve_unfinished_log,
             start_task,
             stop_active_task,
             show_launcher_self,
             close_launcher,
             add_operation,
             add_task,
+            update_operation,
+            update_task,
             export_csv,
             set_always_on_top,
             start_dragging,
@@ -732,4 +996,83 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_time(value: &str) -> DateTime<Local> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Local)
+    }
+
+    #[test]
+    fn completed_log_uses_its_end_time() {
+        let start = local_time("2026-06-28T09:00:00+09:00");
+        let log = TimeLog {
+            task_id: "task-a".to_string(),
+            start_time: start,
+            end_time: Some(start + Duration::minutes(5)),
+        };
+
+        assert_eq!(
+            measured_duration_seconds(
+                &log,
+                None,
+                None,
+                start + Duration::hours(1)
+            ),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn active_log_uses_current_time() {
+        let start = local_time("2026-06-28T09:00:00+09:00");
+        let log = TimeLog {
+            task_id: "task-a".to_string(),
+            start_time: start,
+            end_time: None,
+        };
+
+        assert_eq!(
+            measured_duration_seconds(
+                &log,
+                Some("task-a"),
+                Some(&start),
+                start + Duration::minutes(10)
+            ),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn orphan_log_is_not_counted() {
+        let start = local_time("2026-06-28T09:00:00+09:00");
+        let log = TimeLog {
+            task_id: "task-a".to_string(),
+            start_time: start,
+            end_time: None,
+        };
+
+        assert_eq!(
+            measured_duration_seconds(
+                &log,
+                Some("task-b"),
+                Some(&start),
+                start + Duration::days(10)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_task_without_hidden_flag_remains_visible() {
+        let task: Task =
+            serde_json::from_str(r#"{"id":"task-a","name":"Task","tag":""}"#)
+                .unwrap();
+        assert!(!task.hidden);
+    }
 }

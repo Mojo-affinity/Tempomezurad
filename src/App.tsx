@@ -8,7 +8,9 @@ import {
 } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import HistoryPanel from "./HistoryPanel";
 import { Icon } from "./Icons";
+import ManagePanel from "./ManagePanel";
 
 interface Task {
   id: string;
@@ -74,6 +76,9 @@ function App() {
   const [recentTasks, setRecentTasks] = createSignal<RecentTaskInfo[]>([]);
 
   const [pinned, setPinned] = createSignal(false);
+  const [currentView, setCurrentView] = createSignal<
+    "timer" | "history" | "manage"
+  >("timer");
   const [query, setQuery] = createSignal("");
   const [editMode, setEditMode] = createSignal(false);
   const [showHidden, setShowHidden] = createSignal(false);
@@ -334,6 +339,23 @@ function App() {
         </div>
       </header>
 
+      <Show
+        when={currentView() === "timer"}
+        fallback={
+          currentView() === "history" ? (
+            <div class="app-scroll">
+              <HistoryPanel
+                onExport={() => void exportCsv()}
+                onNotify={notify}
+              />
+            </div>
+          ) : (
+            <div class="app-scroll">
+              <ManagePanel onNotify={notify} />
+            </div>
+          )
+        }
+      >
       <div class="app-scroll">
         <section class={`timer-hero ${active().task_id ? "is-running" : ""}`}>
           <div class="mb-5 flex items-center justify-between">
@@ -770,13 +792,33 @@ function App() {
           </Show>
         </section>
       </div>
+      </Show>
 
-      <footer class="app-footer">
-        <span>
-          <kbd>Ctrl</kbd> <span>+</span> <kbd>Shift</kbd> <span>+</span>{" "}
-          <kbd>Space</kbd>
+      <footer class="app-nav" aria-label="主要画面">
+        <button
+          class={currentView() === "timer" ? "is-active" : ""}
+          onClick={() => setCurrentView("timer")}
+        >
+          <Icon name="timer" size={14} />
+          フォーカス
+        </button>
+        <button
+          class={currentView() === "history" ? "is-active" : ""}
+          onClick={() => setCurrentView("history")}
+        >
+          <Icon name="chart" size={14} />
+          履歴
+        </button>
+        <button
+          class={currentView() === "manage" ? "is-active" : ""}
+          onClick={() => setCurrentView("manage")}
+        >
+          <Icon name="edit" size={14} />
+          管理
+        </button>
+        <span class="app-nav-hint">
+          <kbd>⌃⇧Space</kbd>
         </span>
-        <span>クイックランチャー</span>
       </footer>
 
       <Show when={toast()}>
