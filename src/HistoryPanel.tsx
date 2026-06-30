@@ -24,6 +24,7 @@ interface HistoryEntry {
 
 interface HistoryPanelProps {
   onExport: () => void;
+  onExportSummary: () => void;
   onNotify: (message: string) => void;
 }
 
@@ -173,10 +174,16 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           <h1>作業履歴</h1>
           <p>記録を振り返り、未終了のセッションを整理できます。</p>
         </div>
-        <button class="history-export" onClick={props.onExport}>
-          <Icon name="download" size={14} />
-          CSV
-        </button>
+        <div class="flex items-center gap-1.5">
+          <button class="history-export" onClick={props.onExportSummary} title="日別サマリーをCSVで書き出す">
+            <Icon name="chart" size={14} />
+            サマリー
+          </button>
+          <button class="history-export" onClick={props.onExport} title="詳細ログをCSVで書き出す">
+            <Icon name="download" size={14} />
+            CSV
+          </button>
+        </div>
       </section>
 
       <div class="history-range" aria-label="表示期間">

@@ -207,6 +207,16 @@ function App() {
     }
   };
 
+  const exportSummaryCsv = async () => {
+    try {
+      await invoke<string>("export_summary_csv");
+      notify("日別サマリーCSVを書き出しました");
+    } catch (error) {
+      console.error("サマリーCSVを書き出せませんでした", error);
+      notify("サマリーCSVを書き出せませんでした");
+    }
+  };
+
   const addOperation = async () => {
     if (!opName().trim()) return;
     try {
@@ -346,6 +356,7 @@ function App() {
             <div class="app-scroll">
               <HistoryPanel
                 onExport={() => void exportCsv()}
+                onExportSummary={() => void exportSummaryCsv()}
                 onNotify={notify}
               />
             </div>

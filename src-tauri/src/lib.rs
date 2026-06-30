@@ -899,6 +899,57 @@ fn export_csv(app: AppHandle, state: State<'_, AppState>) -> Result<String, Stri
     Ok(file_path.to_string_lossy().to_string())
 }
 
+/// 日別の作業合計を別 CSV ファイルに書き出してパスを返す
+#[tauri::command]
+fn export_summary_csv(app: AppHandle) -> Result<String, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let logs_dir = app_data_dir.join("logs");
+
+    // 日付 -> 合計秒数 を BTreeMap で集計（日付昇順が保たれる）
+    let mut daily_totals: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+
+    if logs_dir.exists() {
+        for entry in fs::read_dir(&logs_dir).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            if let Ok(daily_log) = serde_json::from_str::<DailyLog>(&content) {
+                for log in daily_log.logs {
+                    if let Some(end_time) = log.end_time {
+                        let date_str = log.start_time.format("%Y-%m-%d").to_string();
+                        *daily_totals.entry(date_str).or_insert(0) +=
+                            (end_time - log.start_time).num_seconds().max(0);
+                    }
+                }
+            }
+        }
+    }
+
+    let export_dir = app_data_dir.join("exports");
+    fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+
+    let filename = format!(
+        "summary_{}.csv",
+        Local::now().format("%Y-%m-%d_%H-%M-%S")
+    );
+    let file_path = export_dir.join(&filename);
+
+    let mut wtr = Writer::from_path(&file_path).map_err(|e| e.to_string())?;
+    wtr.write_record(["日付", "合計時間(分)"])
+        .map_err(|e| e.to_string())?;
+    for (date, total_seconds) in &daily_totals {
+        let total_min = *total_seconds as f64 / 60.0;
+        wtr.write_record([date.as_str(), &format!("{:.1}", total_min)])
+            .map_err(|e| e.to_string())?;
+    }
+    wtr.flush().map_err(|e| e.to_string())?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
 /// ウィンドウの常時最前面を切り替える
 #[tauri::command]
 fn set_always_on_top(app: AppHandle, value: bool) -> Result<(), String> {
@@ -987,6 +1038,7 @@ pub fn run() {
             update_operation,
             update_task,
             export_csv,
+            export_summary_csv,
             set_always_on_top,
             start_dragging,
             reorder_operation,
