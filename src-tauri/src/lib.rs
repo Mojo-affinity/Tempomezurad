@@ -118,6 +118,7 @@ pub struct ManhourPreviewEntry {
     pub task_code: String,
     pub minutes: i64,
     pub time_text: String,
+    pub comment: String,
 }
 
 #[derive(Serialize)]
@@ -137,6 +138,8 @@ pub struct ManhourSubmissionEntry {
     pub project_code: String,
     pub task_code: String,
     pub minutes: i64,
+    #[serde(default)]
+    pub comment: String,
 }
 
 #[derive(Serialize)]
@@ -219,6 +222,7 @@ struct AttendanceConfig {
     password: String,
     attendance_url: String,
     manhour_url: String,
+    certificate_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -229,6 +233,8 @@ struct StoredAttendanceSettings {
     attendance_url: String,
     #[serde(default)]
     manhour_url: String,
+    #[serde(default)]
+    certificate_path: String,
 }
 
 #[derive(Serialize)]
@@ -238,6 +244,7 @@ struct AttendanceSettingsView {
     employee_id: String,
     attendance_url: String,
     manhour_url: String,
+    certificate_path: String,
     password_saved: bool,
     source: String,
 }
@@ -301,6 +308,11 @@ fn parse_attendance_config(content: &str) -> Result<AttendanceConfig, String> {
         password: required("パスワード")?,
         attendance_url: required("出勤簿")?,
         manhour_url: required("工数")?,
+        certificate_path: values
+            .get("証明書")
+            .or_else(|| values.get("証明書パス"))
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -326,6 +338,7 @@ fn load_attendance_config(app: &AppHandle) -> Result<AttendanceConfig, String> {
             password,
             attendance_url: settings.attendance_url,
             manhour_url,
+            certificate_path: settings.certificate_path,
         });
     }
 
@@ -407,20 +420,57 @@ fn format_manhour_minutes(minutes: i64) -> String {
     format!("{}:{:02}", minutes / 60, minutes % 60)
 }
 
+fn allocate_minutes_by_seconds(
+    seconds_by_operation: &BTreeMap<String, i64>,
+    target_minutes: i64,
+) -> HashMap<String, i64> {
+    let total_seconds: i64 = seconds_by_operation.values().sum();
+    if total_seconds <= 0 || target_minutes <= 0 {
+        return HashMap::new();
+    }
+    let mut allocations: Vec<(String, i64, i64)> = seconds_by_operation
+        .iter()
+        .map(|(operation, seconds)| {
+            let weighted = target_minutes * *seconds;
+            (
+                operation.clone(),
+                weighted / total_seconds,
+                weighted % total_seconds,
+            )
+        })
+        .collect();
+    let allocated: i64 = allocations.iter().map(|(_, minutes, _)| *minutes).sum();
+    let mut remaining = target_minutes - allocated;
+    allocations.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    for (_, minutes, _) in &mut allocations {
+        if remaining <= 0 {
+            break;
+        }
+        *minutes += 1;
+        remaining -= 1;
+    }
+    allocations
+        .into_iter()
+        .map(|(operation, minutes, _)| (operation, minutes))
+        .collect()
+}
+
 fn build_manhour_preview(
     master: &MasterData,
     daily_log: &DailyLog,
     date: NaiveDate,
     attendance: Option<&AttendanceDay>,
 ) -> ManhourPreview {
-    let operation_by_task: HashMap<&str, &str> = master
+    let operation_by_task: HashMap<&str, (&str, &str)> = master
         .operations
         .iter()
         .flat_map(|operation| {
-            operation
-                .tasks
-                .iter()
-                .map(move |task| (task.id.as_str(), operation.name.as_str()))
+            operation.tasks.iter().map(move |task| {
+                (
+                    task.id.as_str(),
+                    (operation.name.as_str(), task.name.as_str()),
+                )
+            })
         })
         .collect();
     let mapping_by_operation: HashMap<&str, Option<(String, String)>> = master
@@ -434,20 +484,34 @@ fn build_manhour_preview(
         })
         .collect();
     let mut seconds_by_operation: BTreeMap<String, i64> = BTreeMap::new();
+    let mut task_names_by_operation: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut has_unfinished_logs = false;
     for log in &daily_log.logs {
-        let Some(operation_name) = operation_by_task.get(log.task_id.as_str()) else {
+        let Some((operation_name, task_name)) = operation_by_task.get(log.task_id.as_str()) else {
             continue;
         };
         let Some(end_time) = log.end_time else {
             has_unfinished_logs = true;
             continue;
         };
+        let measured_seconds = (end_time - log.start_time).num_seconds().max(0);
         *seconds_by_operation
             .entry((*operation_name).to_string())
-            .or_insert(0) += (end_time - log.start_time).num_seconds().max(0);
+            .or_insert(0) += measured_seconds;
+        if measured_seconds > 0 {
+            let task_names = task_names_by_operation
+                .entry((*operation_name).to_string())
+                .or_default();
+            if !task_names.iter().any(|name| name.as_str() == *task_name) {
+                task_names.push((*task_name).to_string());
+            }
+        }
     }
 
+    let attendance_work_minutes = attendance.and_then(|day| day.work_minutes);
+    let allocated_minutes = attendance_work_minutes
+        .map(|work| allocate_minutes_by_seconds(&seconds_by_operation, work))
+        .unwrap_or_default();
     let mut entries = Vec::new();
     let mut unmapped_operations = Vec::new();
     for (operation_name, seconds) in seconds_by_operation {
@@ -456,14 +520,22 @@ fn build_manhour_preview(
             .cloned()
             .flatten()
         {
-            let minutes = ((seconds + 30) / 60).max(0);
+            let minutes = attendance_work_minutes
+                .and_then(|_| allocated_minutes.get(&operation_name).copied())
+                .unwrap_or_else(|| ((seconds + 30) / 60).max(0));
             if minutes > 0 {
+                let comment = task_names_by_operation
+                    .get(&operation_name)
+                    .cloned()
+                    .unwrap_or_default()
+                    .join("\n");
                 entries.push(ManhourPreviewEntry {
                     operation_name,
                     project_code,
                     task_code,
                     minutes,
                     time_text: format_manhour_minutes(minutes),
+                    comment,
                 });
             }
         } else if seconds > 0 {
@@ -471,7 +543,6 @@ fn build_manhour_preview(
         }
     }
     let total_minutes = entries.iter().map(|entry| entry.minutes).sum();
-    let attendance_work_minutes = attendance.and_then(|day| day.work_minutes);
     let difference_minutes = attendance_work_minutes.map(|work| work - total_minutes);
 
     ManhourPreview {
@@ -1398,11 +1469,23 @@ fn export_csv(app: AppHandle, state: State<'_, AppState>) -> Result<String, Stri
     Ok(file_path.to_string_lossy().to_string())
 }
 
+fn load_root_certificate(path: &str) -> Result<reqwest::Certificate, String> {
+    let certificate_bytes =
+        fs::read(path).map_err(|error| format!("証明書ファイルを読み込めません: {error}"))?;
+    reqwest::Certificate::from_pem(&certificate_bytes)
+        .or_else(|_| reqwest::Certificate::from_der(&certificate_bytes))
+        .map_err(|error| format!(".cer証明書を解釈できません: {error}"))
+}
+
 async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, String> {
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .cookie_store(true)
         .redirect(Policy::limited(10))
-        .user_agent("Tempomezurado/0.1 attendance integration")
+        .user_agent("Tempomezurado/0.1 attendance integration");
+    if !config.certificate_path.trim().is_empty() {
+        builder = builder.add_root_certificate(load_root_certificate(&config.certificate_path)?);
+    }
+    let client = builder
         .build()
         .map_err(|error| format!("勤怠接続を初期化できません: {error}"))?;
 
@@ -1819,7 +1902,7 @@ async fn prepare_manhour_submission(
         set_form_value(
             &mut fields,
             format!("{prefix}[comment]"),
-            "Tempomezuradoから登録".to_string(),
+            entry.comment.clone(),
         );
     }
     fields.push(("submit".to_string(), "確定".to_string()));
@@ -1850,6 +1933,7 @@ fn get_attendance_settings(app: AppHandle) -> Result<AttendanceSettingsView, Str
             employee_id: settings.employee_id,
             attendance_url: settings.attendance_url,
             manhour_url,
+            certificate_path: settings.certificate_path,
             password_saved: credential_entry()
                 .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
                 .is_ok(),
@@ -1866,6 +1950,7 @@ fn get_attendance_settings(app: AppHandle) -> Result<AttendanceSettingsView, Str
                     employee_id: config.employee_id,
                     attendance_url: config.attendance_url,
                     manhour_url: config.manhour_url,
+                    certificate_path: config.certificate_path,
                     password_saved: true,
                     source: "login.txt".to_string(),
                 });
@@ -1879,6 +1964,7 @@ fn get_attendance_settings(app: AppHandle) -> Result<AttendanceSettingsView, Str
         employee_id: String::new(),
         attendance_url: String::new(),
         manhour_url: String::new(),
+        certificate_path: String::new(),
         password_saved: false,
         source: "none".to_string(),
     })
@@ -1893,6 +1979,7 @@ fn save_attendance_settings(
     employee_id: String,
     attendance_url: String,
     manhour_url: String,
+    certificate_path: String,
     password: String,
 ) -> Result<AttendanceSettingsView, String> {
     let login_url = login_url.trim().to_string();
@@ -1900,6 +1987,7 @@ fn save_attendance_settings(
     let employee_id = employee_id.trim().to_string();
     let attendance_url = attendance_url.trim().to_string();
     let manhour_url = manhour_url.trim().to_string();
+    let certificate_path = certificate_path.trim().to_string();
     if company_id.is_empty() || employee_id.is_empty() {
         return Err("企業IDと従業員番号を入力してください".to_string());
     }
@@ -1912,6 +2000,9 @@ fn save_attendance_settings(
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!("{label}はhttpまたはhttpsで入力してください"));
         }
+    }
+    if !certificate_path.is_empty() {
+        load_root_certificate(&certificate_path)?;
     }
 
     let entry = credential_entry()?;
@@ -1937,6 +2028,7 @@ fn save_attendance_settings(
         employee_id,
         attendance_url,
         manhour_url,
+        certificate_path,
     };
     let path = attendance_settings_file_path(&app)?;
     if let Some(parent) = path.parent() {
@@ -1954,6 +2046,7 @@ fn save_attendance_settings(
         employee_id: settings.employee_id,
         attendance_url: settings.attendance_url,
         manhour_url: settings.manhour_url,
+        certificate_path: settings.certificate_path,
         password_saved: true,
         source: "app".to_string(),
     })
@@ -1995,7 +2088,7 @@ fn get_manhour_preview(
 async fn submit_manhours(
     app: AppHandle,
     date: String,
-    entries: Vec<ManhourSubmissionEntry>,
+    mut entries: Vec<ManhourSubmissionEntry>,
 ) -> Result<ManhourSubmissionResult, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|error| format!("対象日を解釈できません: {error}"))?;
@@ -2007,12 +2100,47 @@ async fn submit_manhours(
     let work_minutes = attendance
         .work_minutes
         .ok_or_else(|| "対象日の実働時間が確定していません".to_string())?;
-    if total_minutes > work_minutes {
+    if total_minutes != work_minutes {
         return Err(format!(
-            "工数合計 {} は実働時間 {} を超えています",
+            "工数合計 {} を実働時間 {} に一致させてください",
             format_manhour_minutes(total_minutes),
             format_manhour_minutes(work_minutes)
         ));
+    }
+    let master = load_master(&app);
+    let daily_log = load_daily_log(&app, date);
+    let preview = build_manhour_preview(&master, &daily_log, date, Some(&attendance));
+    if preview.has_unfinished_logs {
+        return Err("未終了ログを解消してから工数を送信してください".to_string());
+    }
+    if !preview.unmapped_operations.is_empty() {
+        return Err(format!(
+            "工数対応が未設定です: {}",
+            preview.unmapped_operations.join("、")
+        ));
+    }
+    let expected_operations: BTreeSet<String> = preview
+        .entries
+        .iter()
+        .map(|entry| entry.operation_name.clone())
+        .collect();
+    let submitted_operations: BTreeSet<String> = entries
+        .iter()
+        .map(|entry| entry.operation_name.clone())
+        .collect();
+    if expected_operations != submitted_operations {
+        return Err("送信対象のオペレーションが計測ログと一致しません".to_string());
+    }
+    let comments_by_operation: HashMap<String, String> = preview
+        .entries
+        .into_iter()
+        .map(|entry| (entry.operation_name, entry.comment))
+        .collect();
+    for entry in &mut entries {
+        entry.comment = comments_by_operation
+            .get(&entry.operation_name)
+            .cloned()
+            .unwrap_or_default();
     }
 
     let config = load_attendance_config(&app)?;
@@ -2367,23 +2495,43 @@ mod tests {
                 id: "op-a".to_string(),
                 name: "系26-019".to_string(),
                 description: String::new(),
-                tasks: vec![Task {
-                    id: "task-a".to_string(),
-                    name: "実装".to_string(),
-                    tag: String::new(),
-                    hidden: false,
-                }],
+                tasks: vec![
+                    Task {
+                        id: "task-a".to_string(),
+                        name: "実装".to_string(),
+                        tag: String::new(),
+                        hidden: false,
+                    },
+                    Task {
+                        id: "task-b".to_string(),
+                        name: "レビュー".to_string(),
+                        tag: String::new(),
+                        hidden: false,
+                    },
+                ],
                 hidden: false,
                 manhour_project_code: String::new(),
                 manhour_task_code: String::new(),
             }],
         };
         let daily = DailyLog {
-            logs: vec![TimeLog {
-                task_id: "task-a".to_string(),
-                start_time: start,
-                end_time: Some(start + Duration::minutes(95)),
-            }],
+            logs: vec![
+                TimeLog {
+                    task_id: "task-a".to_string(),
+                    start_time: start,
+                    end_time: Some(start + Duration::minutes(60)),
+                },
+                TimeLog {
+                    task_id: "task-a".to_string(),
+                    start_time: start + Duration::minutes(60),
+                    end_time: Some(start + Duration::minutes(95)),
+                },
+                TimeLog {
+                    task_id: "task-b".to_string(),
+                    start_time: start + Duration::minutes(95),
+                    end_time: Some(start + Duration::minutes(105)),
+                },
+            ],
         };
         let attendance = AttendanceDay {
             date: "2026-06-30".to_string(),
@@ -2402,8 +2550,21 @@ mod tests {
         assert_eq!(preview.entries.len(), 1);
         assert_eq!(preview.entries[0].project_code, "系26-0");
         assert_eq!(preview.entries[0].task_code, "系26-019");
-        assert_eq!(preview.entries[0].minutes, 95);
-        assert_eq!(preview.difference_minutes, Some(325));
+        assert_eq!(preview.entries[0].minutes, 420);
+        assert_eq!(preview.entries[0].comment, "実装\nレビュー");
+        assert_eq!(preview.difference_minutes, Some(0));
+    }
+
+    #[test]
+    fn proportional_allocation_preserves_attendance_total() {
+        let seconds = BTreeMap::from([
+            ("系26-019".to_string(), 2 * 60 * 60),
+            ("管理26".to_string(), 60 * 60),
+        ]);
+        let allocated = allocate_minutes_by_seconds(&seconds, 421);
+        assert_eq!(allocated.values().sum::<i64>(), 421);
+        assert_eq!(allocated.get("系26-019"), Some(&281));
+        assert_eq!(allocated.get("管理26"), Some(&140));
     }
 
     #[test]
@@ -2478,6 +2639,7 @@ mod tests {
             project_code: "系26-0".to_string(),
             task_code: "系26-019".to_string(),
             minutes: 1,
+            comment: "実装".to_string(),
         }];
         let prepared = tauri::async_runtime::block_on(prepare_manhour_submission(
             &config,

@@ -37,6 +37,7 @@ interface AttendanceSettings {
   employee_id: string;
   attendance_url: string;
   manhour_url: string;
+  certificate_path: string;
   password_saved: boolean;
   source: "app" | "login.txt" | "none";
 }
@@ -47,6 +48,7 @@ interface ManhourPreviewEntry {
   task_code: string;
   minutes: number;
   time_text: string;
+  comment: string;
 }
 
 interface ManhourPreview {
@@ -122,6 +124,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
       employee_id: "",
       attendance_url: "",
       manhour_url: "",
+      certificate_path: "",
       password_saved: false,
       source: "none",
     });
@@ -260,6 +263,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           employeeId: current.employee_id,
           attendanceUrl: current.attendance_url,
           manhourUrl: current.manhour_url,
+          certificatePath: current.certificate_path,
           password: attendancePassword(),
         },
       );
@@ -330,6 +334,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           project_code: entry.project_code,
           task_code: entry.task_code,
           minutes: entry.minutes,
+          comment: entry.comment,
         })),
       });
       setConfirmManhourSubmit(false);
@@ -503,6 +508,27 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                 autocomplete="url"
               />
             </label>
+            <label>
+              <span>
+                追加証明書
+                <small>任意・.cerの絶対パス</small>
+              </span>
+              <input
+                value={attendanceSettings().certificate_path}
+                onInput={(event) =>
+                  setAttendanceSettings((settings) => ({
+                    ...settings,
+                    certificate_path: event.currentTarget.value,
+                  }))
+                }
+                placeholder={"C:\\certs\\company.cer"}
+                autocomplete="off"
+              />
+            </label>
+            <p class="attendance-certificate-help">
+              Windows証明書ストアは自動利用します。未登録の社内CAがある場合のみ
+              .cerファイルを指定してください。
+            </p>
             <div class="attendance-settings-grid">
               <label>
                 <span>企業ID</span>
@@ -625,7 +651,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
           when={manhourPreview()}
           fallback={
             <p class="attendance-empty">
-              オペレーションを勤怠プロジェクト・タスクへ対応付けて集計します。
+              実働時間を計測ログの比率で按分し、勤怠タスクへ対応付けます。
             </p>
           }
         >
@@ -633,7 +659,7 @@ export default function HistoryPanel(props: HistoryPanelProps) {
             <>
               <div class="manhour-overview">
                 <div>
-                  <span>計測工数</span>
+                  <span>按分工数</span>
                   <strong>{formatMinutes(manhourTotal())}</strong>
                 </div>
                 <div>
@@ -673,11 +699,11 @@ export default function HistoryPanel(props: HistoryPanelProps) {
               <Show
                 when={
                   preview().attendance_work_minutes !== null &&
-                  manhourTotal() > preview().attendance_work_minutes!
+                  manhourTotal() !== preview().attendance_work_minutes!
                 }
               >
                 <p class="manhour-warning">
-                  工数合計が実働時間を超えています。
+                  工数合計を実働時間に一致させてください。
                 </p>
               </Show>
 
@@ -690,6 +716,11 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                         <span>
                           {entry.project_code} / {entry.task_code}
                         </span>
+                        <Show when={entry.comment}>
+                          <span class="manhour-entry-comment">
+                            作業タスク: {entry.comment}
+                          </span>
+                        </Show>
                       </div>
                       <label>
                         <input
@@ -728,8 +759,9 @@ export default function HistoryPanel(props: HistoryPanelProps) {
                         preview().entries.length === 0 ||
                         preview().entries.some((entry) => entry.minutes <= 0) ||
                         preview().has_unfinished_logs ||
+                        preview().unmapped_operations.length > 0 ||
                         preview().attendance_work_minutes === null ||
-                        manhourTotal() >
+                        manhourTotal() !==
                           (preview().attendance_work_minutes ?? 0)
                       }
                     >
