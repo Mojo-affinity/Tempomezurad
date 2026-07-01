@@ -1,7 +1,9 @@
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use csv::Writer;
+use reqwest::{redirect::Policy, Client, Url};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -38,6 +40,10 @@ pub struct Operation {
     pub tasks: Vec<Task>,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
+    pub manhour_project_code: String,
+    #[serde(default)]
+    pub manhour_task_code: String,
 }
 
 /// マスターデータファイル (master.json) に対応
@@ -105,6 +111,52 @@ pub struct HistoryEntry {
     pub is_active: bool,
 }
 
+#[derive(Serialize, Clone)]
+pub struct ManhourPreviewEntry {
+    pub operation_name: String,
+    pub project_code: String,
+    pub task_code: String,
+    pub minutes: i64,
+    pub time_text: String,
+}
+
+#[derive(Serialize)]
+pub struct ManhourPreview {
+    pub date: String,
+    pub entries: Vec<ManhourPreviewEntry>,
+    pub total_minutes: i64,
+    pub attendance_work_minutes: Option<i64>,
+    pub difference_minutes: Option<i64>,
+    pub unmapped_operations: Vec<String>,
+    pub has_unfinished_logs: bool,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ManhourSubmissionEntry {
+    pub operation_name: String,
+    pub project_code: String,
+    pub task_code: String,
+    pub minutes: i64,
+}
+
+#[derive(Serialize)]
+pub struct ManhourSubmissionResult {
+    pub date: String,
+    pub submitted_count: usize,
+    pub total_minutes: i64,
+}
+
+/// 勤怠サイトから取得した日別の勤務実績。
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct AttendanceDay {
+    pub date: String,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub break_minutes: Option<i64>,
+    pub work_minutes: Option<i64>,
+    pub status: Option<String>,
+}
+
 // ============================================================
 // 永続化ヘルパー
 // ============================================================
@@ -122,6 +174,456 @@ fn log_file_path(app: &AppHandle, date: NaiveDate) -> PathBuf {
         .expect("app_data_dir を取得できません")
         .join("logs")
         .join(format!("{}.json", date.format("%Y-%m-%d")))
+}
+
+fn attendance_file_path(app: &AppHandle, date: NaiveDate) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .expect("app_data_dir を取得できません")
+        .join("attendance")
+        .join(format!("{}.json", date.format("%Y-%m-%d")))
+}
+
+fn save_attendance_day(app: &AppHandle, day: &AttendanceDay) -> Result<(), String> {
+    let date = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
+        .map_err(|error| format!("勤怠の日付を解釈できません: {error}"))?;
+    let path = attendance_file_path(app, date);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(day).map_err(|error| error.to_string())?;
+    fs::write(path, content).map_err(|error| error.to_string())
+}
+
+fn load_attendance_days(app: &AppHandle) -> BTreeMap<String, AttendanceDay> {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return BTreeMap::new();
+    };
+    let dir = app_data_dir.join("attendance");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return BTreeMap::new();
+    };
+
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|content| serde_json::from_str::<AttendanceDay>(&content).ok())
+        .map(|day| (day.date.clone(), day))
+        .collect()
+}
+
+struct AttendanceConfig {
+    login_url: String,
+    company_id: String,
+    employee_id: String,
+    password: String,
+    attendance_url: String,
+    manhour_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct StoredAttendanceSettings {
+    login_url: String,
+    company_id: String,
+    employee_id: String,
+    attendance_url: String,
+    #[serde(default)]
+    manhour_url: String,
+}
+
+#[derive(Serialize)]
+struct AttendanceSettingsView {
+    login_url: String,
+    company_id: String,
+    employee_id: String,
+    attendance_url: String,
+    manhour_url: String,
+    password_saved: bool,
+    source: String,
+}
+
+const ATTENDANCE_CREDENTIAL_SERVICE: &str = "com.ubuntu.tempomezurado";
+const ATTENDANCE_CREDENTIAL_USER: &str = "attendance-login";
+
+fn attendance_settings_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?
+        .join("attendance.json"))
+}
+
+fn credential_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(ATTENDANCE_CREDENTIAL_SERVICE, ATTENDANCE_CREDENTIAL_USER)
+        .map_err(|error| format!("Windows資格情報を開けません: {error}"))
+}
+
+fn load_stored_attendance_settings(
+    app: &AppHandle,
+) -> Result<Option<StoredAttendanceSettings>, String> {
+    let path = attendance_settings_file_path(app)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).map_err(|error| format!("勤怠設定を読み込めません: {error}"))?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|error| format!("勤怠設定を解釈できません: {error}"))
+}
+
+fn parse_attendance_config(content: &str) -> Result<AttendanceConfig, String> {
+    let values: HashMap<String, String> = content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches('\u{feff}');
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            line.split_once('=')
+                .or_else(|| line.split_once(':'))
+                .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+
+    let required = |key: &str| {
+        values
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| format!("login.txt に「{key}」がありません"))
+    };
+
+    Ok(AttendanceConfig {
+        login_url: required("url")?,
+        company_id: required("企業ID")?,
+        employee_id: required("従業員番号")?,
+        password: required("パスワード")?,
+        attendance_url: required("出勤簿")?,
+        manhour_url: required("工数")?,
+    })
+}
+
+fn load_attendance_config(app: &AppHandle) -> Result<AttendanceConfig, String> {
+    if let Some(settings) = load_stored_attendance_settings(app)? {
+        let manhour_url = if settings.manhour_url.is_empty() {
+            find_login_file(app)
+                .ok()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|content| parse_attendance_config(&content).ok())
+                .map(|config| config.manhour_url)
+                .unwrap_or_default()
+        } else {
+            settings.manhour_url.clone()
+        };
+        let password = credential_entry()?.get_password().map_err(|_| {
+            "保存済みのパスワードを取得できません。勤怠設定から再入力してください".to_string()
+        })?;
+        return Ok(AttendanceConfig {
+            login_url: settings.login_url,
+            company_id: settings.company_id,
+            employee_id: settings.employee_id,
+            password,
+            attendance_url: settings.attendance_url,
+            manhour_url,
+        });
+    }
+
+    let config_path = find_login_file(app)?;
+    let config_content = fs::read_to_string(config_path)
+        .map_err(|error| format!("login.txt を読み込めません: {error}"))?;
+    parse_attendance_config(&config_content)
+}
+
+fn find_login_file(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("TEMPOMEZURADO_LOGIN_FILE") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::current_dir() {
+        candidates.push(path.join("login.txt"));
+    }
+    if let Ok(path) = std::env::current_exe() {
+        if let Some(parent) = path.parent() {
+            candidates.push(parent.join("login.txt"));
+        }
+    }
+    if let Ok(path) = app.path().app_config_dir() {
+        candidates.push(path.join("login.txt"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "login.txt が見つかりません。アプリの作業フォルダー、実行ファイルと同じフォルダー、またはアプリ設定フォルダーに配置してください".to_string()
+        })
+}
+
+fn text_of(element: scraper::ElementRef<'_>) -> String {
+    element
+        .text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_duration_minutes(value: &str) -> Option<i64> {
+    let (hours, minutes) = value.trim().split_once(':')?;
+    Some(hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?)
+}
+
+fn parse_clock_minutes(value: &str) -> Option<i64> {
+    if value == "--:--" {
+        return None;
+    }
+    parse_duration_minutes(value)
+}
+
+fn parse_manhour_operation(name: &str) -> Option<(String, String)> {
+    let (prefix, number) = name.trim().split_once('-')?;
+    if prefix.is_empty()
+        || number.len() != 3
+        || !number.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let project_digit = number.chars().next()?;
+    Some((format!("{prefix}-{project_digit}"), name.trim().to_string()))
+}
+
+fn operation_manhour_mapping(operation: &Operation) -> Option<(String, String)> {
+    let project_code = operation.manhour_project_code.trim();
+    let task_code = operation.manhour_task_code.trim();
+    if !project_code.is_empty() && !task_code.is_empty() {
+        Some((project_code.to_string(), task_code.to_string()))
+    } else {
+        parse_manhour_operation(&operation.name)
+    }
+}
+
+fn format_manhour_minutes(minutes: i64) -> String {
+    format!("{}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn build_manhour_preview(
+    master: &MasterData,
+    daily_log: &DailyLog,
+    date: NaiveDate,
+    attendance: Option<&AttendanceDay>,
+) -> ManhourPreview {
+    let operation_by_task: HashMap<&str, &str> = master
+        .operations
+        .iter()
+        .flat_map(|operation| {
+            operation
+                .tasks
+                .iter()
+                .map(move |task| (task.id.as_str(), operation.name.as_str()))
+        })
+        .collect();
+    let mapping_by_operation: HashMap<&str, Option<(String, String)>> = master
+        .operations
+        .iter()
+        .map(|operation| {
+            (
+                operation.name.as_str(),
+                operation_manhour_mapping(operation),
+            )
+        })
+        .collect();
+    let mut seconds_by_operation: BTreeMap<String, i64> = BTreeMap::new();
+    let mut has_unfinished_logs = false;
+    for log in &daily_log.logs {
+        let Some(operation_name) = operation_by_task.get(log.task_id.as_str()) else {
+            continue;
+        };
+        let Some(end_time) = log.end_time else {
+            has_unfinished_logs = true;
+            continue;
+        };
+        *seconds_by_operation
+            .entry((*operation_name).to_string())
+            .or_insert(0) += (end_time - log.start_time).num_seconds().max(0);
+    }
+
+    let mut entries = Vec::new();
+    let mut unmapped_operations = Vec::new();
+    for (operation_name, seconds) in seconds_by_operation {
+        if let Some((project_code, task_code)) = mapping_by_operation
+            .get(operation_name.as_str())
+            .cloned()
+            .flatten()
+        {
+            let minutes = ((seconds + 30) / 60).max(0);
+            if minutes > 0 {
+                entries.push(ManhourPreviewEntry {
+                    operation_name,
+                    project_code,
+                    task_code,
+                    minutes,
+                    time_text: format_manhour_minutes(minutes),
+                });
+            }
+        } else if seconds > 0 {
+            unmapped_operations.push(operation_name);
+        }
+    }
+    let total_minutes = entries.iter().map(|entry| entry.minutes).sum();
+    let attendance_work_minutes = attendance.and_then(|day| day.work_minutes);
+    let difference_minutes = attendance_work_minutes.map(|work| work - total_minutes);
+
+    ManhourPreview {
+        date: date.format("%Y-%m-%d").to_string(),
+        entries,
+        total_minutes,
+        attendance_work_minutes,
+        difference_minutes,
+        unmapped_operations,
+        has_unfinished_logs,
+    }
+}
+
+fn parse_attendance_html(html: &str, date: NaiveDate) -> Result<AttendanceDay, String> {
+    let document = Html::parse_document(html);
+    let table_selector = Selector::parse("table").unwrap();
+    // ブラウザーは tbody を補完するが、サーバーHTMLには存在しない場合がある。
+    let row_selector = Selector::parse("tr").unwrap();
+    let cell_selector = Selector::parse("td").unwrap();
+
+    let mut date_rows = None;
+    let mut detail_rows = None;
+    for table in document.select(&table_selector) {
+        let table_text = text_of(table);
+        let rows: Vec<Vec<String>> = table
+            .select(&row_selector)
+            .map(|row| row.select(&cell_selector).map(text_of).collect())
+            .filter(|cells: &Vec<String>| !cells.is_empty())
+            .collect();
+        if table_text.contains("日付") && !table_text.contains("集計(出)") {
+            date_rows = Some(rows);
+        } else if table_text.contains("集計(出)") && table_text.contains("休憩時間") {
+            detail_rows = Some(rows);
+        }
+    }
+
+    let dates = date_rows.ok_or_else(|| "出勤簿の日付一覧を取得できませんでした".to_string())?;
+    let details =
+        detail_rows.ok_or_else(|| "出勤簿の勤務実績を取得できませんでした".to_string())?;
+    let target = date.format("%m/%d").to_string();
+    let index = dates
+        .iter()
+        .position(|cells| {
+            cells
+                .first()
+                .is_some_and(|value| value.starts_with(&target))
+        })
+        .ok_or_else(|| format!("{target} の勤怠が見つかりません"))?;
+    let cells = details
+        .get(index)
+        .ok_or_else(|| "出勤簿の日付と勤務実績の行数が一致しません".to_string())?;
+    if cells.len() < 8 {
+        return Err("出勤簿の列構成を解釈できませんでした".to_string());
+    }
+
+    let aggregate: Vec<&str> = cells[3]
+        .split_whitespace()
+        .filter(|value| value.contains(':'))
+        .collect();
+    let start_time = aggregate
+        .first()
+        .filter(|value| **value != "--:--")
+        .map(|value| (*value).to_string());
+    let end_time = aggregate
+        .get(1)
+        .filter(|value| **value != "--:--")
+        .map(|value| (*value).to_string());
+    let break_minutes = parse_duration_minutes(&cells[7]);
+    let site_work_minutes = parse_duration_minutes(&cells[5]);
+    let calculated_work_minutes = start_time
+        .as_deref()
+        .and_then(parse_clock_minutes)
+        .zip(end_time.as_deref().and_then(parse_clock_minutes))
+        .map(|(start, end)| (end - start).max(0) - break_minutes.unwrap_or(0))
+        .map(|minutes| minutes.max(0));
+
+    Ok(AttendanceDay {
+        date: date.format("%Y-%m-%d").to_string(),
+        start_time,
+        end_time,
+        break_minutes,
+        work_minutes: site_work_minutes.or(calculated_work_minutes),
+        status: cells
+            .get(4)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+fn attendance_url_for_date(base: &str, date: NaiveDate) -> Result<Url, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("出勤簿URLが不正です: {error}"))?;
+    let mut segments: Vec<String> = url
+        .path_segments()
+        .ok_or_else(|| "出勤簿URLを解釈できません".to_string())?
+        .map(str::to_string)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments
+        .last()
+        .is_some_and(|segment| segment.len() == 6 && segment.chars().all(|c| c.is_ascii_digit()))
+    {
+        segments.pop();
+    }
+    segments.push(date.format("%Y%m").to_string());
+    url.set_path(&format!("/{}", segments.join("/")));
+    Ok(url)
+}
+
+fn decode_javascript_string(script: &str) -> Option<String> {
+    let (position, call_len) = script
+        .find(".html(")
+        .map(|position| (position, ".html(".len()))
+        .or_else(|| {
+            script
+                .find(".replaceWith(")
+                .map(|position| (position, ".replaceWith(".len()))
+        })?;
+    let start = position + call_len;
+    let input = script[start..].trim_start();
+    let quote = input.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let mut chars = input[quote.len_utf8()..].chars();
+    let mut output = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == quote {
+            return Some(output);
+        }
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            'b' => output.push('\u{0008}'),
+            'f' => output.push('\u{000c}'),
+            'u' => {
+                let digits: String = chars.by_ref().take(4).collect();
+                output.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+            }
+            'x' => {
+                let digits: String = chars.by_ref().take(2).collect();
+                output.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+            }
+            escaped => output.push(escaped),
+        }
+    }
+    None
 }
 
 fn load_master(app: &AppHandle) -> MasterData {
@@ -172,9 +674,8 @@ fn measured_duration_seconds(
 ) -> Option<i64> {
     let end = match log.end_time {
         Some(end) => end,
-        None
-            if active_task_id == Some(log.task_id.as_str())
-                && active_task_start == Some(&log.start_time) =>
+        None if active_task_id == Some(log.task_id.as_str())
+            && active_task_start == Some(&log.start_time) =>
         {
             now
         }
@@ -354,12 +855,14 @@ fn get_recent_tasks(app: AppHandle, state: State<'_, AppState>) -> Vec<RecentTas
     let mut result: Vec<RecentTaskInfo> = sorted
         .into_iter()
         .filter_map(|(task_id, _)| {
-            task_map.get(&task_id).map(|(name, op_name, tag)| RecentTaskInfo {
-                task_id: task_id.clone(),
-                task_name: name.clone(),
-                operation_name: op_name.clone(),
-                tag: tag.clone(),
-            })
+            task_map
+                .get(&task_id)
+                .map(|(name, op_name, tag)| RecentTaskInfo {
+                    task_id: task_id.clone(),
+                    task_name: name.clone(),
+                    operation_name: op_name.clone(),
+                    tag: tag.clone(),
+                })
         })
         .collect();
 
@@ -428,11 +931,7 @@ fn get_history(
         for task in &operation.tasks {
             task_map.insert(
                 task.id.clone(),
-                (
-                    task.name.clone(),
-                    operation.name.clone(),
-                    task.tag.clone(),
-                ),
+                (task.name.clone(), operation.name.clone(), task.tag.clone()),
             );
         }
     }
@@ -458,9 +957,7 @@ fn get_history(
 
             for log in daily_log.logs {
                 // 未終了ログは期間外でも必ず返し、ユーザーが見失わないようにする。
-                if log.end_time.is_some()
-                    && cutoff.is_some_and(|value| log.start_time < value)
-                {
+                if log.end_time.is_some() && cutoff.is_some_and(|value| log.start_time < value) {
                     continue;
                 }
                 let is_active = active_task_id.as_ref() == Some(&log.task_id)
@@ -471,10 +968,8 @@ fn get_history(
                     active_task_start.as_ref(),
                     now,
                 );
-                let (task_name, operation_name, tag) = task_map
-                    .get(&log.task_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
+                let (task_name, operation_name, tag) =
+                    task_map.get(&log.task_id).cloned().unwrap_or_else(|| {
                         (
                             "(削除済みタスク)".to_string(),
                             "(不明)".to_string(),
@@ -528,9 +1023,7 @@ fn resolve_unfinished_log(
         .logs
         .iter()
         .position(|log| {
-            log.task_id == task_id
-                && log.start_time == parsed_start
-                && log.end_time.is_none()
+            log.task_id == task_id && log.start_time == parsed_start && log.end_time.is_none()
         })
         .ok_or_else(|| "対象の未終了ログが見つかりません".to_string())?;
 
@@ -556,11 +1049,7 @@ fn resolve_unfinished_log(
 
 /// タスク計測を開始する（既存アクティブタスクがあれば自動終了）
 #[tauri::command]
-fn start_task(
-    app: AppHandle,
-    task_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+fn start_task(app: AppHandle, task_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let now = Local::now();
 
     // タスク存在確認 (data ロックは短期間で解放)
@@ -646,6 +1135,8 @@ fn add_operation(
         description,
         tasks: vec![],
         hidden: false,
+        manhour_project_code: String::new(),
+        manhour_task_code: String::new(),
     });
     save_master(&app, &data)?;
     Ok(id)
@@ -684,6 +1175,8 @@ fn update_operation(
     op_id: String,
     name: String,
     description: String,
+    manhour_project_code: Option<String>,
+    manhour_task_code: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let trimmed_name = name.trim();
@@ -699,6 +1192,12 @@ fn update_operation(
         .ok_or_else(|| format!("オペレーション '{}' が見つかりません", op_id))?;
     operation.name = trimmed_name.to_string();
     operation.description = description.trim().to_string();
+    if let Some(project_code) = manhour_project_code {
+        operation.manhour_project_code = project_code.trim().to_string();
+    }
+    if let Some(task_code) = manhour_task_code {
+        operation.manhour_task_code = task_code.trim().to_string();
+    }
     save_master(&app, &data)?;
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -899,15 +1398,663 @@ fn export_csv(app: AppHandle, state: State<'_, AppState>) -> Result<String, Stri
     Ok(file_path.to_string_lossy().to_string())
 }
 
-/// 日別の作業合計を別 CSV ファイルに書き出してパスを返す
+async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, String> {
+    let client = Client::builder()
+        .cookie_store(true)
+        .redirect(Policy::limited(10))
+        .user_agent("Tempomezurado/0.1 attendance integration")
+        .build()
+        .map_err(|error| format!("勤怠接続を初期化できません: {error}"))?;
+
+    let mut login_page_url =
+        Url::parse(&config.login_url).map_err(|error| format!("ログインURLが不正です: {error}"))?;
+    login_page_url
+        .query_pairs_mut()
+        .append_pair("login_company_code", &config.company_id);
+    let login_page = client
+        .get(login_page_url)
+        .send()
+        .await
+        .map_err(|error| format!("ログイン画面へ接続できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("ログイン画面を取得できません: {error}"))?
+        .text()
+        .await
+        .map_err(|error| format!("ログイン画面を読み取れません: {error}"))?;
+
+    let authenticity_token = {
+        let document = Html::parse_document(&login_page);
+        let selector = Selector::parse("input[name=\"authenticity_token\"]").unwrap();
+        document
+            .select(&selector)
+            .next()
+            .and_then(|element| element.value().attr("value"))
+            .map(str::to_string)
+            .ok_or_else(|| "ログイン画面の認証トークンを取得できませんでした".to_string())?
+    };
+
+    let login_response = client
+        .post(&config.login_url)
+        .form(&[
+            ("authenticity_token", authenticity_token.as_str()),
+            ("form[company_id]", config.company_id.as_str()),
+            ("form[login_id]", config.employee_id.as_str()),
+            ("form[password]", config.password.as_str()),
+            ("form[next]", ""),
+            ("form[fill_company_id_and_login_id]", "0"),
+            ("commit", "ログイン"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("勤怠サイトへログインできません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("勤怠サイトのログインに失敗しました: {error}"))?;
+    let remained_on_login = login_response.url().path().ends_with("/login");
+    let login_result = login_response
+        .text()
+        .await
+        .map_err(|error| format!("ログイン結果を読み取れません: {error}"))?;
+    if remained_on_login && login_result.contains("submit-button") {
+        return Err(
+            "勤怠サイトへログインできませんでした。login.txt の認証情報を確認してください"
+                .to_string(),
+        );
+    }
+    Ok(client)
+}
+
+async fn request_attendance_day(
+    config: &AttendanceConfig,
+    date: NaiveDate,
+) -> Result<AttendanceDay, String> {
+    let client = login_attendance_client(config).await?;
+    let attendance_url = attendance_url_for_date(&config.attendance_url, date)?;
+    let attendance_response = client
+        .get(attendance_url)
+        .send()
+        .await
+        .map_err(|error| format!("出勤簿へ接続できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("出勤簿を取得できません: {error}"))?;
+    let attendance_page_url = attendance_response.url().clone();
+    let attendance_path = attendance_page_url.path().to_string();
+    let attendance_html = attendance_response
+        .text()
+        .await
+        .map_err(|error| format!("出勤簿を読み取れません: {error}"))?;
+    if attendance_html.contains("id=\"submit-button\"") {
+        return Err("出勤簿を開く前にログイン状態が失われました".to_string());
+    }
+
+    let records_path = {
+        let document = Html::parse_document(&attendance_html);
+        let selector = Selector::parse("[data-records-url]").unwrap();
+        document
+            .select(&selector)
+            .next()
+            .and_then(|element| element.value().attr("data-records-url"))
+            .map(str::to_string)
+            .ok_or_else(|| "出勤簿の勤務実績URLを取得できませんでした".to_string())?
+    };
+    let mut records_url = attendance_page_url
+        .join(&records_path)
+        .map_err(|error| format!("勤務実績URLを解釈できません: {error}"))?;
+    let records_path = format!(
+        "{}/{}",
+        records_url.path().trim_end_matches('/'),
+        date.format("%Y%m")
+    );
+    records_url.set_path(&records_path);
+    let records_script = client
+        .get(records_url)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header(
+            "Accept",
+            "text/javascript, application/javascript, application/ecmascript, application/x-ecmascript",
+        )
+        .send()
+        .await
+        .map_err(|error| format!("勤務実績へ接続できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("勤務実績を取得できません: {error}"))?
+        .text()
+        .await
+        .map_err(|error| format!("勤務実績を読み取れません: {error}"))?;
+    let records_html = decode_javascript_string(&records_script).ok_or_else(|| {
+        format!(
+            "勤務実績の応答を解釈できませんでした（長さ: {}、html呼出: {}、置換呼出: {}）",
+            records_script.len(),
+            records_script.contains(".html("),
+            records_script.contains("replaceWith(")
+        )
+    })?;
+
+    parse_attendance_html(&records_html, date)
+        .map_err(|error| format!("{error}（応答先: {attendance_path}）"))
+}
+
+fn manhour_report_url(base: &str, date: NaiveDate) -> Result<Url, String> {
+    let mut url = Url::parse(base).map_err(|error| format!("工数URLが不正です: {error}"))?;
+    let path = url.path().trim_end_matches('/');
+    let prefix = path
+        .strip_suffix("/manhours")
+        .ok_or_else(|| "工数URLは工数管理簿のURLを指定してください".to_string())?;
+    url.set_path(&format!("{prefix}/manhour_reports/new"));
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("date", &date.format("%Y-%m-%d").to_string());
+    Ok(url)
+}
+
+fn collect_remote_options(value: &serde_json::Value, options: &mut Vec<(String, String)>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_remote_options(value, options);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let id =
+                object
+                    .get("id")
+                    .or_else(|| object.get("value"))
+                    .and_then(|value| match value {
+                        serde_json::Value::String(value) => Some(value.clone()),
+                        serde_json::Value::Number(value) => Some(value.to_string()),
+                        _ => None,
+                    });
+            let text = object
+                .get("text")
+                .or_else(|| object.get("label"))
+                .or_else(|| object.get("name"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            if let (Some(id), Some(text)) = (id, text) {
+                options.push((id, text));
+            }
+            for child in object.values() {
+                collect_remote_options(child, options);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn resolve_remote_option(
+    client: &Client,
+    page_url: &Url,
+    endpoint: &str,
+    code: &str,
+    staff_id: &str,
+    date: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<String, String> {
+    let url = page_url
+        .join(endpoint)
+        .map_err(|error| format!("工数検索URLを解釈できません: {error}"))?;
+    let mut query = vec![
+        ("q".to_string(), code.to_string()),
+        ("staff_id".to_string(), staff_id.to_string()),
+    ];
+    if let Some(date) = date {
+        query.push(("date".to_string(), date.to_string()));
+    }
+    if let Some(project_id) = project_id {
+        query.push(("project_id".to_string(), project_id.to_string()));
+    }
+    let body = client
+        .get(url)
+        .query(&query)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .send()
+        .await
+        .map_err(|error| format!("{code}を検索できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("{code}の検索に失敗しました: {error}"))?
+        .text()
+        .await
+        .map_err(|error| format!("{code}の検索結果を読み取れません: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("{code}の検索結果を解釈できません: {error}"))?;
+    let mut options = Vec::new();
+    collect_remote_options(&value, &mut options);
+    options
+        .into_iter()
+        .find(|(_, text)| {
+            text.trim_start().starts_with(code)
+                && (text == code
+                    || text
+                        .chars()
+                        .nth(code.chars().count())
+                        .is_some_and(|character| {
+                            character.is_whitespace() || character == '(' || character == '（'
+                        }))
+        })
+        .map(|(id, _)| id)
+        .ok_or_else(|| format!("勤怠サイトに「{code}」が見つかりません"))
+}
+
+fn collect_form_fields(html: &str) -> Result<Vec<(String, String)>, String> {
+    let document = Html::parse_document(html);
+    let form_selector = Selector::parse("form#new_form").unwrap();
+    let field_selector = Selector::parse("input[name], textarea[name], select[name]").unwrap();
+    let option_selector = Selector::parse("option").unwrap();
+    let form = document
+        .select(&form_selector)
+        .next()
+        .ok_or_else(|| "工数入力フォームが見つかりません".to_string())?;
+    let mut fields = Vec::new();
+    for field in form.select(&field_selector) {
+        let name = field.value().attr("name").unwrap_or_default();
+        if name.is_empty() || name == "project_name" {
+            continue;
+        }
+        let tag = field.value().name();
+        let input_type = field.value().attr("type").unwrap_or_default();
+        if matches!(input_type, "button" | "submit" | "reset" | "file")
+            || (matches!(input_type, "checkbox" | "radio")
+                && field.value().attr("checked").is_none())
+        {
+            continue;
+        }
+        let value = match tag {
+            "textarea" => text_of(field),
+            "select" => field
+                .select(&option_selector)
+                .find(|option| option.value().attr("selected").is_some())
+                .or_else(|| field.select(&option_selector).next())
+                .and_then(|option| option.value().attr("value"))
+                .unwrap_or_default()
+                .to_string(),
+            _ => field.value().attr("value").unwrap_or_default().to_string(),
+        };
+        fields.push((name.to_string(), value));
+    }
+    Ok(fields)
+}
+
+fn set_form_value(fields: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some(field) = fields
+        .iter_mut()
+        .find(|(field_name, _)| *field_name == name)
+    {
+        field.1 = value;
+    } else {
+        fields.push((name, value));
+    }
+}
+
+struct PreparedManhourSubmission {
+    client: Client,
+    submit_url: Url,
+    fields: Vec<(String, String)>,
+}
+
+async fn prepare_manhour_submission(
+    config: &AttendanceConfig,
+    date: NaiveDate,
+    entries: &[ManhourSubmissionEntry],
+) -> Result<PreparedManhourSubmission, String> {
+    if config.manhour_url.trim().is_empty() {
+        return Err("接続設定に工数URLを入力してください".to_string());
+    }
+    if entries.is_empty() {
+        return Err("送信する工数がありません".to_string());
+    }
+    for entry in entries {
+        if entry.project_code.trim().is_empty() || entry.task_code.trim().is_empty() {
+            return Err(format!(
+                "{}の工数プロジェクト・タスクを設定してください",
+                entry.operation_name
+            ));
+        }
+        if entry.minutes <= 0 || entry.minutes > 24 * 60 {
+            return Err(format!("{}の時間を確認してください", entry.operation_name));
+        }
+    }
+
+    let client = login_attendance_client(config).await?;
+    let report_url = manhour_report_url(&config.manhour_url, date)?;
+    let response = client
+        .get(report_url)
+        .send()
+        .await
+        .map_err(|error| format!("工数入力画面へ接続できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("工数入力画面を取得できません: {error}"))?;
+    let page_url = response.url().clone();
+    let html = response
+        .text()
+        .await
+        .map_err(|error| format!("工数入力画面を読み取れません: {error}"))?;
+    let (submit_url, project_search_url) = {
+        let document = Html::parse_document(&html);
+        let form_selector = Selector::parse("form#new_form").unwrap();
+        let project_selector = Selector::parse("#project_name").unwrap();
+        let form = document
+            .select(&form_selector)
+            .next()
+            .ok_or_else(|| "工数入力フォームが見つかりません".to_string())?;
+        let submit_url = page_url
+            .join(
+                form.value()
+                    .attr("action")
+                    .unwrap_or("/ja/sp/manhour_reports"),
+            )
+            .map_err(|error| format!("工数送信URLを解釈できません: {error}"))?;
+        let project_search_url = document
+            .select(&project_selector)
+            .next()
+            .and_then(|element| element.value().attr("data-search-url"))
+            .unwrap_or("/ja/sp/manhour_reports/search_projects")
+            .to_string();
+        (submit_url, project_search_url)
+    };
+    let task_search_url = "/ja/sp/manhour_reports/search_tasks";
+    let mut fields = collect_form_fields(&html)?;
+    let staff_id = fields
+        .iter()
+        .find(|(name, _)| name == "staff_id")
+        .map(|(_, value)| value.clone())
+        .ok_or_else(|| "工数入力対象の従業員を取得できません".to_string())?;
+    let apply_date = fields
+        .iter()
+        .find(|(name, _)| name == "form[apply_dates][]")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| date.format("%Y-%m-%d").to_string());
+
+    let existing_task_prefixes: HashMap<String, String> = fields
+        .iter()
+        .filter(|(name, _)| name.ends_with("[task_id]"))
+        .map(|(name, value)| {
+            (
+                value.clone(),
+                name.trim_end_matches("[task_id]").to_string(),
+            )
+        })
+        .collect();
+    let mut project_ids: HashMap<String, String> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let project_id = if let Some(id) = project_ids.get(&entry.project_code) {
+            id.clone()
+        } else {
+            let id = resolve_remote_option(
+                &client,
+                &page_url,
+                &project_search_url,
+                &entry.project_code,
+                &staff_id,
+                Some(&apply_date),
+                None,
+            )
+            .await?;
+            project_ids.insert(entry.project_code.clone(), id.clone());
+            id
+        };
+        let task_id = resolve_remote_option(
+            &client,
+            &page_url,
+            task_search_url,
+            &entry.task_code,
+            &staff_id,
+            None,
+            Some(&project_id),
+        )
+        .await?;
+        let prefix = existing_task_prefixes
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "form[manhour_attributes][{project_id}][manhours][{}]",
+                    10_000 + index
+                )
+            });
+        set_form_value(&mut fields, format!("{prefix}[task_id]"), task_id);
+        set_form_value(
+            &mut fields,
+            format!("{prefix}[hour_text]"),
+            format_manhour_minutes(entry.minutes),
+        );
+        set_form_value(
+            &mut fields,
+            format!("{prefix}[comment]"),
+            "Tempomezuradoから登録".to_string(),
+        );
+    }
+    fields.push(("submit".to_string(), "確定".to_string()));
+    Ok(PreparedManhourSubmission {
+        client,
+        submit_url,
+        fields,
+    })
+}
+
+/// アプリ内の勤怠設定画面へ、パスワードを除いた現在値を返す。
+#[tauri::command]
+fn get_attendance_settings(app: AppHandle) -> Result<AttendanceSettingsView, String> {
+    if let Some(settings) = load_stored_attendance_settings(&app)? {
+        let manhour_url = if settings.manhour_url.is_empty() {
+            find_login_file(&app)
+                .ok()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|content| parse_attendance_config(&content).ok())
+                .map(|config| config.manhour_url)
+                .unwrap_or_default()
+        } else {
+            settings.manhour_url.clone()
+        };
+        return Ok(AttendanceSettingsView {
+            login_url: settings.login_url,
+            company_id: settings.company_id,
+            employee_id: settings.employee_id,
+            attendance_url: settings.attendance_url,
+            manhour_url,
+            password_saved: credential_entry()
+                .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
+                .is_ok(),
+            source: "app".to_string(),
+        });
+    }
+
+    if let Ok(path) = find_login_file(&app) {
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(config) = parse_attendance_config(&content) {
+                return Ok(AttendanceSettingsView {
+                    login_url: config.login_url,
+                    company_id: config.company_id,
+                    employee_id: config.employee_id,
+                    attendance_url: config.attendance_url,
+                    manhour_url: config.manhour_url,
+                    password_saved: true,
+                    source: "login.txt".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(AttendanceSettingsView {
+        login_url: String::new(),
+        company_id: String::new(),
+        employee_id: String::new(),
+        attendance_url: String::new(),
+        manhour_url: String::new(),
+        password_saved: false,
+        source: "none".to_string(),
+    })
+}
+
+/// 勤怠の接続情報を保存する。パスワードだけはWindows資格情報マネージャーへ格納する。
+#[tauri::command]
+fn save_attendance_settings(
+    app: AppHandle,
+    login_url: String,
+    company_id: String,
+    employee_id: String,
+    attendance_url: String,
+    manhour_url: String,
+    password: String,
+) -> Result<AttendanceSettingsView, String> {
+    let login_url = login_url.trim().to_string();
+    let company_id = company_id.trim().to_string();
+    let employee_id = employee_id.trim().to_string();
+    let attendance_url = attendance_url.trim().to_string();
+    let manhour_url = manhour_url.trim().to_string();
+    if company_id.is_empty() || employee_id.is_empty() {
+        return Err("企業IDと従業員番号を入力してください".to_string());
+    }
+    for (label, value) in [
+        ("ログインURL", login_url.as_str()),
+        ("出勤簿URL", attendance_url.as_str()),
+        ("工数URL", manhour_url.as_str()),
+    ] {
+        let parsed = Url::parse(value).map_err(|_| format!("{label}を確認してください"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!("{label}はhttpまたはhttpsで入力してください"));
+        }
+    }
+
+    let entry = credential_entry()?;
+    let password = if password.is_empty() {
+        entry.get_password().ok().or_else(|| {
+            find_login_file(&app)
+                .ok()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|content| parse_attendance_config(&content).ok())
+                .map(|config| config.password)
+        })
+    } else {
+        Some(password)
+    }
+    .ok_or_else(|| "パスワードを入力してください".to_string())?;
+    entry
+        .set_password(&password)
+        .map_err(|error| format!("パスワードを安全に保存できません: {error}"))?;
+
+    let settings = StoredAttendanceSettings {
+        login_url,
+        company_id,
+        employee_id,
+        attendance_url,
+        manhour_url,
+    };
+    let path = attendance_settings_file_path(&app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("勤怠設定を保存できません: {error}"))?;
+
+    Ok(AttendanceSettingsView {
+        login_url: settings.login_url,
+        company_id: settings.company_id,
+        employee_id: settings.employee_id,
+        attendance_url: settings.attendance_url,
+        manhour_url: settings.manhour_url,
+        password_saved: true,
+        source: "app".to_string(),
+    })
+}
+
+/// login.txt の認証情報で勤怠サイトにログインし、指定日の勤務実績を取得する。
+#[tauri::command]
+async fn fetch_attendance_day(app: AppHandle, date: String) -> Result<AttendanceDay, String> {
+    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .map_err(|error| format!("対象日を解釈できません: {error}"))?;
+    let config = load_attendance_config(&app)?;
+    let day = request_attendance_day(&config, date).await?;
+    save_attendance_day(&app, &day)?;
+    Ok(day)
+}
+
+/// 日別ログを、勤怠サイトの「親プロジェクト / タスク」形式へ変換して返す。
+#[tauri::command]
+fn get_manhour_preview(
+    app: AppHandle,
+    date: String,
+    state: State<'_, AppState>,
+) -> Result<ManhourPreview, String> {
+    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .map_err(|error| format!("対象日を解釈できません: {error}"))?;
+    let master = state.data.lock().unwrap().clone();
+    let daily_log = load_daily_log(&app, date);
+    let attendance_days = load_attendance_days(&app);
+    Ok(build_manhour_preview(
+        &master,
+        &daily_log,
+        date,
+        attendance_days.get(&date.format("%Y-%m-%d").to_string()),
+    ))
+}
+
+/// プレビューで確認済みの日別工数を勤怠サイトへ送信する。
+#[tauri::command]
+async fn submit_manhours(
+    app: AppHandle,
+    date: String,
+    entries: Vec<ManhourSubmissionEntry>,
+) -> Result<ManhourSubmissionResult, String> {
+    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .map_err(|error| format!("対象日を解釈できません: {error}"))?;
+    let total_minutes: i64 = entries.iter().map(|entry| entry.minutes).sum();
+    let attendance = load_attendance_days(&app)
+        .get(&date.format("%Y-%m-%d").to_string())
+        .cloned()
+        .ok_or_else(|| "先に対象日の勤怠を取得してください".to_string())?;
+    let work_minutes = attendance
+        .work_minutes
+        .ok_or_else(|| "対象日の実働時間が確定していません".to_string())?;
+    if total_minutes > work_minutes {
+        return Err(format!(
+            "工数合計 {} は実働時間 {} を超えています",
+            format_manhour_minutes(total_minutes),
+            format_manhour_minutes(work_minutes)
+        ));
+    }
+
+    let config = load_attendance_config(&app)?;
+    let prepared = prepare_manhour_submission(&config, date, &entries).await?;
+    let response = prepared
+        .client
+        .post(prepared.submit_url)
+        .form(&prepared.fields)
+        .send()
+        .await
+        .map_err(|error| format!("工数を送信できません: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("工数の登録に失敗しました: {error}"))?;
+    let final_path = response.url().path().to_string();
+    let response_html = response
+        .text()
+        .await
+        .map_err(|error| format!("工数登録結果を読み取れません: {error}"))?;
+    if final_path.ends_with("/manhour_reports")
+        && response_html.contains("new_form")
+        && (response_html.contains("error") || response_html.contains("alert"))
+    {
+        return Err(
+            "勤怠サイトが工数入力を受け付けませんでした。内容を確認してください".to_string(),
+        );
+    }
+
+    Ok(ManhourSubmissionResult {
+        date: date.format("%Y-%m-%d").to_string(),
+        submitted_count: entries.len(),
+        total_minutes,
+    })
+}
+
+/// 日別の作業合計と、取得済みの勤怠実績を CSV ファイルに書き出してパスを返す
 #[tauri::command]
 fn export_summary_csv(app: AppHandle) -> Result<String, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let logs_dir = app_data_dir.join("logs");
 
     // 日付 -> 合計秒数 を BTreeMap で集計（日付昇順が保たれる）
-    let mut daily_totals: std::collections::BTreeMap<String, i64> =
-        std::collections::BTreeMap::new();
+    let mut daily_totals: BTreeMap<String, i64> = BTreeMap::new();
 
     if logs_dir.exists() {
         for entry in fs::read_dir(&logs_dir).map_err(|e| e.to_string())? {
@@ -931,19 +2078,64 @@ fn export_summary_csv(app: AppHandle) -> Result<String, String> {
     let export_dir = app_data_dir.join("exports");
     fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
 
-    let filename = format!(
-        "summary_{}.csv",
-        Local::now().format("%Y-%m-%d_%H-%M-%S")
-    );
+    let filename = format!("summary_{}.csv", Local::now().format("%Y-%m-%d_%H-%M-%S"));
     let file_path = export_dir.join(&filename);
 
+    let attendance_days = load_attendance_days(&app);
+    let all_dates: BTreeSet<String> = daily_totals
+        .keys()
+        .chain(attendance_days.keys())
+        .cloned()
+        .collect();
+
     let mut wtr = Writer::from_path(&file_path).map_err(|e| e.to_string())?;
-    wtr.write_record(["日付", "合計時間(分)"])
+    wtr.write_record([
+        "日付",
+        "計測時間(分)",
+        "始業時間",
+        "終業時間",
+        "休憩時間(分)",
+        "業務時間(分)",
+        "計測との差(分)",
+        "勤務状況",
+    ])
+    .map_err(|e| e.to_string())?;
+    for date in all_dates {
+        let tracked_minutes = daily_totals
+            .get(&date)
+            .map(|seconds| *seconds as f64 / 60.0);
+        let attendance = attendance_days.get(&date);
+        let difference = attendance
+            .and_then(|day| day.work_minutes)
+            .zip(tracked_minutes)
+            .map(|(work, tracked)| work as f64 - tracked);
+        wtr.write_record([
+            date,
+            tracked_minutes
+                .map(|minutes| format!("{minutes:.1}"))
+                .unwrap_or_default(),
+            attendance
+                .and_then(|day| day.start_time.clone())
+                .unwrap_or_default(),
+            attendance
+                .and_then(|day| day.end_time.clone())
+                .unwrap_or_default(),
+            attendance
+                .and_then(|day| day.break_minutes)
+                .map(|minutes| minutes.to_string())
+                .unwrap_or_default(),
+            attendance
+                .and_then(|day| day.work_minutes)
+                .map(|minutes| minutes.to_string())
+                .unwrap_or_default(),
+            difference
+                .map(|minutes| format!("{minutes:.1}"))
+                .unwrap_or_default(),
+            attendance
+                .and_then(|day| day.status.clone())
+                .unwrap_or_default(),
+        ])
         .map_err(|e| e.to_string())?;
-    for (date, total_seconds) in &daily_totals {
-        let total_min = *total_seconds as f64 / 60.0;
-        wtr.write_record([date.as_str(), &format!("{:.1}", total_min)])
-            .map_err(|e| e.to_string())?;
     }
     wtr.flush().map_err(|e| e.to_string())?;
 
@@ -1038,6 +2230,11 @@ pub fn run() {
             update_operation,
             update_task,
             export_csv,
+            get_attendance_settings,
+            save_attendance_settings,
+            fetch_attendance_day,
+            get_manhour_preview,
+            submit_manhours,
             export_summary_csv,
             set_always_on_top,
             start_dragging,
@@ -1070,12 +2267,7 @@ mod tests {
         };
 
         assert_eq!(
-            measured_duration_seconds(
-                &log,
-                None,
-                None,
-                start + Duration::hours(1)
-            ),
+            measured_duration_seconds(&log, None, None, start + Duration::hours(1)),
             Some(300)
         );
     }
@@ -1122,9 +2314,180 @@ mod tests {
 
     #[test]
     fn legacy_task_without_hidden_flag_remains_visible() {
-        let task: Task =
-            serde_json::from_str(r#"{"id":"task-a","name":"Task","tag":""}"#)
-                .unwrap();
+        let task: Task = serde_json::from_str(r#"{"id":"task-a","name":"Task","tag":""}"#).unwrap();
         assert!(!task.hidden);
+    }
+
+    #[test]
+    fn parses_login_txt_without_exposing_values() {
+        let config = parse_attendance_config(
+            "url=https://example.test/ja/login\n企業ID=company\n従業員番号=employee\nパスワード=secret\n出勤簿=https://example.test/ja/sp/attendance\n工数=https://example.test/ja/sp/manhours\n",
+        )
+        .unwrap();
+        assert_eq!(config.company_id, "company");
+        assert_eq!(
+            config.attendance_url,
+            "https://example.test/ja/sp/attendance"
+        );
+        assert_eq!(config.manhour_url, "https://example.test/ja/sp/manhours");
+    }
+
+    #[test]
+    fn maps_operation_code_to_parent_project() {
+        assert_eq!(
+            parse_manhour_operation("系26-019"),
+            Some(("系26-0".to_string(), "系26-019".to_string()))
+        );
+        assert_eq!(
+            parse_manhour_operation("系26-219"),
+            Some(("系26-2".to_string(), "系26-219".to_string()))
+        );
+        assert_eq!(parse_manhour_operation("管理"), None);
+
+        let operation = Operation {
+            id: "op-management".to_string(),
+            name: "管理26".to_string(),
+            description: String::new(),
+            tasks: vec![],
+            hidden: false,
+            manhour_project_code: "管理26".to_string(),
+            manhour_task_code: "管理26-001".to_string(),
+        };
+        assert_eq!(
+            operation_manhour_mapping(&operation),
+            Some(("管理26".to_string(), "管理26-001".to_string()))
+        );
+    }
+
+    #[test]
+    fn aggregates_logs_by_operation_for_manhour_preview() {
+        let start = local_time("2026-06-30T09:00:00+09:00");
+        let master = MasterData {
+            operations: vec![Operation {
+                id: "op-a".to_string(),
+                name: "系26-019".to_string(),
+                description: String::new(),
+                tasks: vec![Task {
+                    id: "task-a".to_string(),
+                    name: "実装".to_string(),
+                    tag: String::new(),
+                    hidden: false,
+                }],
+                hidden: false,
+                manhour_project_code: String::new(),
+                manhour_task_code: String::new(),
+            }],
+        };
+        let daily = DailyLog {
+            logs: vec![TimeLog {
+                task_id: "task-a".to_string(),
+                start_time: start,
+                end_time: Some(start + Duration::minutes(95)),
+            }],
+        };
+        let attendance = AttendanceDay {
+            date: "2026-06-30".to_string(),
+            start_time: Some("09:00".to_string()),
+            end_time: Some("17:00".to_string()),
+            break_minutes: Some(60),
+            work_minutes: Some(420),
+            status: Some("勤務".to_string()),
+        };
+        let preview = build_manhour_preview(
+            &master,
+            &daily,
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+            Some(&attendance),
+        );
+        assert_eq!(preview.entries.len(), 1);
+        assert_eq!(preview.entries[0].project_code, "系26-0");
+        assert_eq!(preview.entries[0].task_code, "系26-019");
+        assert_eq!(preview.entries[0].minutes, 95);
+        assert_eq!(preview.difference_minutes, Some(325));
+    }
+
+    #[test]
+    fn parses_aggregate_times_and_work_duration_from_attendance() {
+        let html = r#"
+            <table>
+              <thead><tr><th>日付</th></tr></thead>
+              <tbody>
+                <tr><td>06/29(月)</td></tr>
+                <tr><td>06/30(火)</td></tr>
+              </tbody>
+            </table>
+            <table>
+              <thead><tr><th>集計(出) 集計(退)</th><th>休憩時間</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>11:00 15:00</td><td>09:00 18:00</td><td>09:00 18:00</td>
+                  <td>09:00 18:00</td><td>勤務</td><td>8:00</td><td>0:00</td><td>1:00</td>
+                </tr>
+                <tr>
+                  <td>11:00 15:00</td><td>08:30 17:45</td><td>08:30 17:45</td>
+                  <td>08:30 17:45</td><td>テレワーク</td><td>8:15</td><td>0:00</td><td>1:00</td>
+                </tr>
+              </tbody>
+            </table>
+        "#;
+        let day =
+            parse_attendance_html(html, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()).unwrap();
+        assert_eq!(day.start_time.as_deref(), Some("08:30"));
+        assert_eq!(day.end_time.as_deref(), Some("17:45"));
+        assert_eq!(day.break_minutes, Some(60));
+        assert_eq!(day.work_minutes, Some(495));
+        assert_eq!(day.status.as_deref(), Some("テレワーク"));
+    }
+
+    #[test]
+    fn attendance_url_uses_requested_month() {
+        let url = attendance_url_for_date(
+            "https://example.test/ja/sp/attendance/202605",
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.test/ja/sp/attendance/202606");
+    }
+
+    #[test]
+    fn decodes_replace_with_javascript_response() {
+        let script = r##"$("#records").replaceWith("\u003ctable\u003e\u003ctr\u003e\u003ctd\u003e08:30\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e");"##;
+        assert_eq!(
+            decode_javascript_string(script).as_deref(),
+            Some("<table><tr><td>08:30</td></tr></table>")
+        );
+    }
+
+    #[test]
+    #[ignore = "ローカルのlogin.txtと勤怠サイトへの接続が必要"]
+    fn fetches_live_attendance_without_logging_credentials() {
+        let login_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../login.txt");
+        let config = parse_attendance_config(&fs::read_to_string(login_path).unwrap()).unwrap();
+        let date = Local::now().date_naive();
+        let day = tauri::async_runtime::block_on(request_attendance_day(&config, date)).unwrap();
+        assert_eq!(day.date, date.format("%Y-%m-%d").to_string());
+    }
+
+    #[test]
+    #[ignore = "ローカルのlogin.txtと勤怠サイトへの接続が必要"]
+    fn prepares_live_manhour_without_submitting() {
+        let login_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../login.txt");
+        let config = parse_attendance_config(&fs::read_to_string(login_path).unwrap()).unwrap();
+        let entries = vec![ManhourSubmissionEntry {
+            operation_name: "系26-019".to_string(),
+            project_code: "系26-0".to_string(),
+            task_code: "系26-019".to_string(),
+            minutes: 1,
+        }];
+        let prepared = tauri::async_runtime::block_on(prepare_manhour_submission(
+            &config,
+            Local::now().date_naive(),
+            &entries,
+        ))
+        .unwrap();
+        assert!(prepared
+            .fields
+            .iter()
+            .any(|(name, value)| name.ends_with("[hour_text]") && value == "0:01"));
     }
 }

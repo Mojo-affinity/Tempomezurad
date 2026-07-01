@@ -23,6 +23,8 @@ interface Operation {
   description: string;
   tasks: Task[];
   hidden: boolean;
+  manhour_project_code: string;
+  manhour_task_code: string;
 }
 
 interface AppStateView {
@@ -44,6 +46,8 @@ export default function ManagePanel(props: ManagePanelProps) {
   const [editingTaskId, setEditingTaskId] = createSignal<string | null>(null);
   const [editName, setEditName] = createSignal("");
   const [editSecondary, setEditSecondary] = createSignal("");
+  const [editManhourProject, setEditManhourProject] = createSignal("");
+  const [editManhourTask, setEditManhourTask] = createSignal("");
 
   const [showAddOperation, setShowAddOperation] = createSignal(false);
   const [addTaskTo, setAddTaskTo] = createSignal<string | null>(null);
@@ -90,6 +94,8 @@ export default function ManagePanel(props: ManagePanelProps) {
     setEditingOperationId(operation.id);
     setEditName(operation.name);
     setEditSecondary(operation.description);
+    setEditManhourProject(operation.manhour_project_code);
+    setEditManhourTask(operation.manhour_task_code);
   };
 
   const beginTaskEdit = (task: Task) => {
@@ -111,6 +117,8 @@ export default function ManagePanel(props: ManagePanelProps) {
         opId: operationId,
         name: editName(),
         description: editSecondary(),
+        manhourProjectCode: editManhourProject(),
+        manhourTaskCode: editManhourTask(),
       });
       cancelEdit();
       await loadState();
@@ -284,6 +292,17 @@ export default function ManagePanel(props: ManagePanelProps) {
                       <p class="truncate">
                         {operation.description || "説明はありません"}
                       </p>
+                      <Show
+                        when={
+                          operation.manhour_project_code &&
+                          operation.manhour_task_code
+                        }
+                      >
+                        <p class="manage-manhour-map">
+                          工数 {operation.manhour_project_code} /{" "}
+                          {operation.manhour_task_code}
+                        </p>
+                      </Show>
                     </div>
                     <div class="flex items-center">
                       <button
@@ -351,6 +370,31 @@ export default function ManagePanel(props: ManagePanelProps) {
                       }
                     />
                   </label>
+                  <div class="manage-manhour-fields">
+                    <label>
+                      <span>工数プロジェクト</span>
+                      <input
+                        value={editManhourProject()}
+                        onInput={(event) =>
+                          setEditManhourProject(event.currentTarget.value)
+                        }
+                        placeholder="例: 管理26 / 系24-0"
+                      />
+                    </label>
+                    <label>
+                      <span>工数タスク</span>
+                      <input
+                        value={editManhourTask()}
+                        onInput={(event) =>
+                          setEditManhourTask(event.currentTarget.value)
+                        }
+                        placeholder="勤怠側のタスクコード"
+                      />
+                    </label>
+                  </div>
+                  <p class="manage-manhour-help">
+                    系26-019形式は自動対応します。系24・管理26などはここで対応先を指定できます。
+                  </p>
                   <div class="flex gap-1.5">
                     <button class="secondary-button" onClick={cancelEdit}>
                       キャンセル
