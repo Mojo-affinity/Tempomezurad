@@ -4,7 +4,9 @@ use reqwest::{redirect::Policy, Client, Url};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
+use std::error::Error as StdError;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -149,6 +151,12 @@ pub struct ManhourSubmissionResult {
     pub total_minutes: i64,
 }
 
+#[derive(Serialize)]
+pub struct ConnectionDiagnosticsView {
+    pub path: String,
+    pub content: String,
+}
+
 /// 勤怠サイトから取得した日別の勤務実績。
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AttendanceDay {
@@ -251,6 +259,113 @@ struct AttendanceSettingsView {
 
 const ATTENDANCE_CREDENTIAL_SERVICE: &str = "com.ubuntu.tempomezurado";
 const ATTENDANCE_CREDENTIAL_USER: &str = "attendance-login";
+const CONNECTION_LOG_MAX_BYTES: u64 = 512 * 1024;
+
+#[derive(Clone)]
+struct ConnectionLogger {
+    path: PathBuf,
+}
+
+impl ConnectionLogger {
+    fn new(app: &AppHandle) -> Result<Self, String> {
+        let directory = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("診断ログの保存先を取得できません: {error}"))?
+            .join("diagnostics");
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("診断ログの保存先を作成できません: {error}"))?;
+        Ok(Self {
+            path: directory.join("connection.log"),
+        })
+    }
+
+    fn write(&self, level: &str, message: impl AsRef<str>) {
+        if fs::metadata(&self.path)
+            .map(|metadata| metadata.len() >= CONNECTION_LOG_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            let _ = fs::write(&self.path, "");
+        }
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let _ = writeln!(file, "[{timestamp}] [{level}] {}", message.as_ref());
+        }
+    }
+
+    fn info(&self, message: impl AsRef<str>) {
+        self.write("INFO", message);
+    }
+
+    fn error(&self, message: impl AsRef<str>) {
+        self.write("ERROR", message);
+    }
+}
+
+fn endpoint_for_log(value: &str) -> String {
+    Url::parse(value)
+        .map(|url| {
+            let host = url.host_str().unwrap_or("(hostなし)");
+            let port = url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            format!("{}://{host}{port}{}", url.scheme(), url.path())
+        })
+        .unwrap_or_else(|_| "(URLを解釈できません)".to_string())
+}
+
+fn reqwest_error_for_log(error: &reqwest::Error) -> String {
+    let mut properties = Vec::new();
+    if error.is_connect() {
+        properties.push("connect");
+    }
+    if error.is_timeout() {
+        properties.push("timeout");
+    }
+    if error.is_redirect() {
+        properties.push("redirect");
+    }
+    if error.is_status() {
+        properties.push("status");
+    }
+    let kind = if properties.is_empty() {
+        "other".to_string()
+    } else {
+        properties.join(",")
+    };
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !causes.iter().any(|existing| existing == &text) {
+            causes.push(text);
+        }
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        format!("種別={kind}; {error}")
+    } else {
+        format!("種別={kind}; {error}; 原因={}", causes.join(" -> "))
+    }
+}
+
+fn request_error(logger: Option<&ConnectionLogger>, stage: &str, error: reqwest::Error) -> String {
+    let endpoint = error
+        .url()
+        .map(|url| endpoint_for_log(url.as_str()))
+        .unwrap_or_else(|| "(URLなし)".to_string());
+    let error = error.without_url();
+    let details = reqwest_error_for_log(&error);
+    if let Some(logger) = logger {
+        logger.error(format!("{stage}: endpoint={endpoint}; {details}"));
+    }
+    format!("{stage}。接続診断ログを確認してください: {error}")
+}
 
 fn attendance_settings_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
@@ -1469,41 +1584,112 @@ fn export_csv(app: AppHandle, state: State<'_, AppState>) -> Result<String, Stri
     Ok(file_path.to_string_lossy().to_string())
 }
 
-fn load_root_certificate(path: &str) -> Result<reqwest::Certificate, String> {
-    let certificate_bytes =
-        fs::read(path).map_err(|error| format!("証明書ファイルを読み込めません: {error}"))?;
-    reqwest::Certificate::from_pem(&certificate_bytes)
-        .or_else(|_| reqwest::Certificate::from_der(&certificate_bytes))
-        .map_err(|error| format!(".cer証明書を解釈できません: {error}"))
+struct LoadedCertificates {
+    certificates: Vec<reqwest::Certificate>,
+    format: &'static str,
+    bytes: usize,
 }
 
-async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, String> {
+fn load_root_certificates(path: &str) -> Result<LoadedCertificates, String> {
+    let certificate_bytes =
+        fs::read(path).map_err(|error| format!("証明書ファイルを読み込めません: {error}"))?;
+    if certificate_bytes.is_empty() {
+        return Err("証明書ファイルが空です".to_string());
+    }
+    let is_pem = certificate_bytes
+        .windows(b"-----BEGIN CERTIFICATE-----".len())
+        .any(|window| window == b"-----BEGIN CERTIFICATE-----");
+    let certificates = if is_pem {
+        reqwest::Certificate::from_pem_bundle(&certificate_bytes)
+            .map_err(|error| format!("PEM証明書を解釈できません: {error}"))?
+    } else {
+        vec![reqwest::Certificate::from_der(&certificate_bytes).map_err(|error| {
+            format!(
+                "DER形式のX.509証明書を解釈できません: {error}。PKCS#7やPFXではなく、X.509のCERを指定してください"
+            )
+        })?]
+    };
+    if certificates.is_empty() {
+        return Err("証明書ファイルにX.509証明書がありません".to_string());
+    }
+    Ok(LoadedCertificates {
+        certificates,
+        format: if is_pem { "PEM" } else { "DER" },
+        bytes: certificate_bytes.len(),
+    })
+}
+
+async fn login_attendance_client(
+    config: &AttendanceConfig,
+    logger: Option<&ConnectionLogger>,
+) -> Result<Client, String> {
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "TLSクライアント初期化: backend=native-tls (Windows証明書ストア), login={}",
+            endpoint_for_log(&config.login_url)
+        ));
+    }
     let mut builder = Client::builder()
         .cookie_store(true)
         .redirect(Policy::limited(10))
         .user_agent("Tempomezurado/0.1 attendance integration");
     if !config.certificate_path.trim().is_empty() {
-        builder = builder.add_root_certificate(load_root_certificate(&config.certificate_path)?);
+        let loaded = load_root_certificates(&config.certificate_path).map_err(|error| {
+            if let Some(logger) = logger {
+                logger.error(format!("追加証明書の読込失敗: {error}"));
+            }
+            error
+        })?;
+        if let Some(logger) = logger {
+            let filename = PathBuf::from(&config.certificate_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("(ファイル名不明)")
+                .to_string();
+            logger.info(format!(
+                "追加証明書を信頼ルートとして読込: file={filename}, format={}, certificates={}, bytes={}",
+                loaded.format,
+                loaded.certificates.len(),
+                loaded.bytes
+            ));
+            logger.info(
+                "注意: クライアント証明書認証が必要な環境では、秘密鍵を含まない.cer単体は使用できません",
+            );
+        }
+        for certificate in loaded.certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    } else if let Some(logger) = logger {
+        logger.info("追加証明書なし: Windows証明書ストアのみ使用");
     }
     let client = builder
         .build()
-        .map_err(|error| format!("勤怠接続を初期化できません: {error}"))?;
+        .map_err(|error| request_error(logger, "勤怠接続を初期化できません", error))?;
 
     let mut login_page_url =
         Url::parse(&config.login_url).map_err(|error| format!("ログインURLが不正です: {error}"))?;
     login_page_url
         .query_pairs_mut()
         .append_pair("login_company_code", &config.company_id);
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "ログイン画面へ接続開始: {}",
+            endpoint_for_log(login_page_url.as_str())
+        ));
+    }
     let login_page = client
         .get(login_page_url)
         .send()
         .await
-        .map_err(|error| format!("ログイン画面へ接続できません: {error}"))?
+        .map_err(|error| request_error(logger, "ログイン画面へ接続できません", error))?
         .error_for_status()
-        .map_err(|error| format!("ログイン画面を取得できません: {error}"))?
+        .map_err(|error| request_error(logger, "ログイン画面を取得できません", error))?
         .text()
         .await
-        .map_err(|error| format!("ログイン画面を読み取れません: {error}"))?;
+        .map_err(|error| request_error(logger, "ログイン画面を読み取れません", error))?;
+    if let Some(logger) = logger {
+        logger.info("ログイン画面取得成功・認証トークンを検証");
+    }
 
     let authenticity_token = {
         let document = Html::parse_document(&login_page);
@@ -1513,9 +1699,17 @@ async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, St
             .next()
             .and_then(|element| element.value().attr("value"))
             .map(str::to_string)
-            .ok_or_else(|| "ログイン画面の認証トークンを取得できませんでした".to_string())?
+            .ok_or_else(|| {
+                if let Some(logger) = logger {
+                    logger.error("ログイン画面にauthenticity_tokenが見つかりません");
+                }
+                "ログイン画面の認証トークンを取得できませんでした".to_string()
+            })?
     };
 
+    if let Some(logger) = logger {
+        logger.info("認証情報を送信（企業ID・従業員番号・パスワードはログに記録しません）");
+    }
     let login_response = client
         .post(&config.login_url)
         .form(&[
@@ -1529,19 +1723,31 @@ async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, St
         ])
         .send()
         .await
-        .map_err(|error| format!("勤怠サイトへログインできません: {error}"))?
+        .map_err(|error| request_error(logger, "勤怠サイトへログインできません", error))?
         .error_for_status()
-        .map_err(|error| format!("勤怠サイトのログインに失敗しました: {error}"))?;
+        .map_err(|error| request_error(logger, "勤怠サイトのログインに失敗しました", error))?;
     let remained_on_login = login_response.url().path().ends_with("/login");
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "ログイン応答受信: final={}",
+            endpoint_for_log(login_response.url().as_str())
+        ));
+    }
     let login_result = login_response
         .text()
         .await
-        .map_err(|error| format!("ログイン結果を読み取れません: {error}"))?;
+        .map_err(|error| request_error(logger, "ログイン結果を読み取れません", error))?;
     if remained_on_login && login_result.contains("submit-button") {
+        if let Some(logger) = logger {
+            logger.error("ログイン画面に留まりました（認証情報またはサイト側応答を確認）");
+        }
         return Err(
-            "勤怠サイトへログインできませんでした。login.txt の認証情報を確認してください"
+            "勤怠サイトへログインできませんでした。接続設定の認証情報と診断ログを確認してください"
                 .to_string(),
         );
+    }
+    if let Some(logger) = logger {
+        logger.info("ログイン成功");
     }
     Ok(client)
 }
@@ -1549,23 +1755,33 @@ async fn login_attendance_client(config: &AttendanceConfig) -> Result<Client, St
 async fn request_attendance_day(
     config: &AttendanceConfig,
     date: NaiveDate,
+    logger: Option<&ConnectionLogger>,
 ) -> Result<AttendanceDay, String> {
-    let client = login_attendance_client(config).await?;
+    let client = login_attendance_client(config, logger).await?;
     let attendance_url = attendance_url_for_date(&config.attendance_url, date)?;
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "出勤簿へ接続開始: {}",
+            endpoint_for_log(attendance_url.as_str())
+        ));
+    }
     let attendance_response = client
         .get(attendance_url)
         .send()
         .await
-        .map_err(|error| format!("出勤簿へ接続できません: {error}"))?
+        .map_err(|error| request_error(logger, "出勤簿へ接続できません", error))?
         .error_for_status()
-        .map_err(|error| format!("出勤簿を取得できません: {error}"))?;
+        .map_err(|error| request_error(logger, "出勤簿を取得できません", error))?;
     let attendance_page_url = attendance_response.url().clone();
     let attendance_path = attendance_page_url.path().to_string();
     let attendance_html = attendance_response
         .text()
         .await
-        .map_err(|error| format!("出勤簿を読み取れません: {error}"))?;
+        .map_err(|error| request_error(logger, "出勤簿を読み取れません", error))?;
     if attendance_html.contains("id=\"submit-button\"") {
+        if let Some(logger) = logger {
+            logger.error("出勤簿への遷移後にログイン画面が返されました");
+        }
         return Err("出勤簿を開く前にログイン状態が失われました".to_string());
     }
 
@@ -1588,6 +1804,12 @@ async fn request_attendance_day(
         date.format("%Y%m")
     );
     records_url.set_path(&records_path);
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "勤務実績へ接続開始: {}",
+            endpoint_for_log(records_url.as_str())
+        ));
+    }
     let records_script = client
         .get(records_url)
         .header("X-Requested-With", "XMLHttpRequest")
@@ -1597,13 +1819,21 @@ async fn request_attendance_day(
         )
         .send()
         .await
-        .map_err(|error| format!("勤務実績へ接続できません: {error}"))?
+        .map_err(|error| request_error(logger, "勤務実績へ接続できません", error))?
         .error_for_status()
-        .map_err(|error| format!("勤務実績を取得できません: {error}"))?
+        .map_err(|error| request_error(logger, "勤務実績を取得できません", error))?
         .text()
         .await
-        .map_err(|error| format!("勤務実績を読み取れません: {error}"))?;
+        .map_err(|error| request_error(logger, "勤務実績を読み取れません", error))?;
     let records_html = decode_javascript_string(&records_script).ok_or_else(|| {
+        if let Some(logger) = logger {
+            logger.error(format!(
+                "勤務実績の応答形式が想定外: bytes={}, html_call={}, replace_call={}",
+                records_script.len(),
+                records_script.contains(".html("),
+                records_script.contains("replaceWith(")
+            ));
+        }
         format!(
             "勤務実績の応答を解釈できませんでした（長さ: {}、html呼出: {}、置換呼出: {}）",
             records_script.len(),
@@ -1612,8 +1842,23 @@ async fn request_attendance_day(
         )
     })?;
 
-    parse_attendance_html(&records_html, date)
-        .map_err(|error| format!("{error}（応答先: {attendance_path}）"))
+    let day = parse_attendance_html(&records_html, date)
+        .map_err(|error| format!("{error}（応答先: {attendance_path}）"))?;
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "勤怠取得成功: date={}, start={}, end={}, break_minutes={}, work_minutes={}",
+            day.date,
+            day.start_time.as_deref().unwrap_or("-"),
+            day.end_time.as_deref().unwrap_or("-"),
+            day.break_minutes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            day.work_minutes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    Ok(day)
 }
 
 fn manhour_report_url(base: &str, date: NaiveDate) -> Result<Url, String> {
@@ -1777,6 +2022,7 @@ async fn prepare_manhour_submission(
     config: &AttendanceConfig,
     date: NaiveDate,
     entries: &[ManhourSubmissionEntry],
+    logger: Option<&ConnectionLogger>,
 ) -> Result<PreparedManhourSubmission, String> {
     if config.manhour_url.trim().is_empty() {
         return Err("接続設定に工数URLを入力してください".to_string());
@@ -1796,20 +2042,26 @@ async fn prepare_manhour_submission(
         }
     }
 
-    let client = login_attendance_client(config).await?;
+    let client = login_attendance_client(config, logger).await?;
     let report_url = manhour_report_url(&config.manhour_url, date)?;
+    if let Some(logger) = logger {
+        logger.info(format!(
+            "工数入力画面へ接続開始: {}",
+            endpoint_for_log(report_url.as_str())
+        ));
+    }
     let response = client
         .get(report_url)
         .send()
         .await
-        .map_err(|error| format!("工数入力画面へ接続できません: {error}"))?
+        .map_err(|error| request_error(logger, "工数入力画面へ接続できません", error))?
         .error_for_status()
-        .map_err(|error| format!("工数入力画面を取得できません: {error}"))?;
+        .map_err(|error| request_error(logger, "工数入力画面を取得できません", error))?;
     let page_url = response.url().clone();
     let html = response
         .text()
         .await
-        .map_err(|error| format!("工数入力画面を読み取れません: {error}"))?;
+        .map_err(|error| request_error(logger, "工数入力画面を読み取れません", error))?;
     let (submit_url, project_search_url) = {
         let document = Html::parse_document(&html);
         let form_selector = Selector::parse("form#new_form").unwrap();
@@ -2002,7 +2254,15 @@ fn save_attendance_settings(
         }
     }
     if !certificate_path.is_empty() {
-        load_root_certificate(&certificate_path)?;
+        let loaded = load_root_certificates(&certificate_path)?;
+        if let Ok(logger) = ConnectionLogger::new(&app) {
+            logger.info(format!(
+                "接続設定の証明書検証成功: format={}, certificates={}, bytes={}",
+                loaded.format,
+                loaded.certificates.len(),
+                loaded.bytes
+            ));
+        }
     }
 
     let entry = credential_entry()?;
@@ -2052,14 +2312,51 @@ fn save_attendance_settings(
     })
 }
 
+#[tauri::command]
+fn get_connection_diagnostics(app: AppHandle) -> Result<ConnectionDiagnosticsView, String> {
+    let logger = ConnectionLogger::new(&app)?;
+    let content = if logger.path.is_file() {
+        fs::read_to_string(&logger.path)
+            .map_err(|error| format!("診断ログを読み込めません: {error}"))?
+    } else {
+        String::new()
+    };
+    Ok(ConnectionDiagnosticsView {
+        path: logger.path.to_string_lossy().to_string(),
+        content,
+    })
+}
+
+#[tauri::command]
+fn clear_connection_diagnostics(app: AppHandle) -> Result<(), String> {
+    let logger = ConnectionLogger::new(&app)?;
+    fs::write(&logger.path, "").map_err(|error| format!("診断ログを消去できません: {error}"))
+}
+
+#[tauri::command]
+async fn test_attendance_connection(app: AppHandle) -> Result<String, String> {
+    let logger = ConnectionLogger::new(&app)?;
+    logger.info("=== 接続テスト開始 ===");
+    let config = load_attendance_config(&app).map_err(|error| {
+        logger.error(format!("接続設定の読込失敗: {error}"));
+        error
+    })?;
+    login_attendance_client(&config, Some(&logger)).await?;
+    logger.info("=== 接続テスト成功 ===");
+    Ok("ログイン接続に成功しました".to_string())
+}
+
 /// login.txt の認証情報で勤怠サイトにログインし、指定日の勤務実績を取得する。
 #[tauri::command]
 async fn fetch_attendance_day(app: AppHandle, date: String) -> Result<AttendanceDay, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|error| format!("対象日を解釈できません: {error}"))?;
     let config = load_attendance_config(&app)?;
-    let day = request_attendance_day(&config, date).await?;
+    let logger = ConnectionLogger::new(&app)?;
+    logger.info(format!("=== 勤怠取得開始: date={date} ==="));
+    let day = request_attendance_day(&config, date, Some(&logger)).await?;
     save_attendance_day(&app, &day)?;
+    logger.info("=== 勤怠取得完了 ===");
     Ok(day)
 }
 
@@ -2144,29 +2441,36 @@ async fn submit_manhours(
     }
 
     let config = load_attendance_config(&app)?;
-    let prepared = prepare_manhour_submission(&config, date, &entries).await?;
+    let logger = ConnectionLogger::new(&app)?;
+    logger.info(format!(
+        "=== 工数送信開始: date={date}, entries={} ===",
+        entries.len()
+    ));
+    let prepared = prepare_manhour_submission(&config, date, &entries, Some(&logger)).await?;
     let response = prepared
         .client
         .post(prepared.submit_url)
         .form(&prepared.fields)
         .send()
         .await
-        .map_err(|error| format!("工数を送信できません: {error}"))?
+        .map_err(|error| request_error(Some(&logger), "工数を送信できません", error))?
         .error_for_status()
-        .map_err(|error| format!("工数の登録に失敗しました: {error}"))?;
+        .map_err(|error| request_error(Some(&logger), "工数の登録に失敗しました", error))?;
     let final_path = response.url().path().to_string();
     let response_html = response
         .text()
         .await
-        .map_err(|error| format!("工数登録結果を読み取れません: {error}"))?;
+        .map_err(|error| request_error(Some(&logger), "工数登録結果を読み取れません", error))?;
     if final_path.ends_with("/manhour_reports")
         && response_html.contains("new_form")
         && (response_html.contains("error") || response_html.contains("alert"))
     {
+        logger.error("工数登録画面に入力エラーまたは警告が返されました");
         return Err(
             "勤怠サイトが工数入力を受け付けませんでした。内容を確認してください".to_string(),
         );
     }
+    logger.info("=== 工数送信完了 ===");
 
     Ok(ManhourSubmissionResult {
         date: date.format("%Y-%m-%d").to_string(),
@@ -2360,6 +2664,9 @@ pub fn run() {
             export_csv,
             get_attendance_settings,
             save_attendance_settings,
+            get_connection_diagnostics,
+            clear_connection_diagnostics,
+            test_attendance_connection,
             fetch_attendance_day,
             get_manhour_preview,
             submit_manhours,
@@ -2611,6 +2918,16 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_endpoint_hides_credentials_and_query() {
+        assert_eq!(
+            endpoint_for_log(
+                "https://user:secret@example.test:8443/ja/login?login_company_code=private#token"
+            ),
+            "https://example.test:8443/ja/login"
+        );
+    }
+
+    #[test]
     fn decodes_replace_with_javascript_response() {
         let script = r##"$("#records").replaceWith("\u003ctable\u003e\u003ctr\u003e\u003ctd\u003e08:30\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e");"##;
         assert_eq!(
@@ -2625,7 +2942,8 @@ mod tests {
         let login_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../login.txt");
         let config = parse_attendance_config(&fs::read_to_string(login_path).unwrap()).unwrap();
         let date = Local::now().date_naive();
-        let day = tauri::async_runtime::block_on(request_attendance_day(&config, date)).unwrap();
+        let day =
+            tauri::async_runtime::block_on(request_attendance_day(&config, date, None)).unwrap();
         assert_eq!(day.date, date.format("%Y-%m-%d").to_string());
     }
 
@@ -2645,6 +2963,7 @@ mod tests {
             &config,
             Local::now().date_naive(),
             &entries,
+            None,
         ))
         .unwrap();
         assert!(prepared

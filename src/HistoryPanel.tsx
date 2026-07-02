@@ -61,6 +61,11 @@ interface ManhourPreview {
   has_unfinished_logs: boolean;
 }
 
+interface ConnectionDiagnostics {
+  path: string;
+  content: string;
+}
+
 interface HistoryPanelProps {
   onExport: () => void;
   onExportSummary: () => void;
@@ -132,6 +137,11 @@ export default function HistoryPanel(props: HistoryPanelProps) {
   const [showAttendanceSettings, setShowAttendanceSettings] =
     createSignal(false);
   const [settingsSaving, setSettingsSaving] = createSignal(false);
+  const [connectionDiagnostics, setConnectionDiagnostics] =
+    createSignal<ConnectionDiagnostics | null>(null);
+  const [showConnectionDiagnostics, setShowConnectionDiagnostics] =
+    createSignal(false);
+  const [connectionTesting, setConnectionTesting] = createSignal(false);
   const [manhourPreview, setManhourPreview] =
     createSignal<ManhourPreview | null>(null);
   const [manhourLoading, setManhourLoading] = createSignal(false);
@@ -139,6 +149,55 @@ export default function HistoryPanel(props: HistoryPanelProps) {
   const [confirmManhourSubmit, setConfirmManhourSubmit] = createSignal(false);
   let unlistenHistory: (() => void) | undefined;
   let unlistenState: (() => void) | undefined;
+
+  const loadConnectionDiagnostics = async (show = true) => {
+    try {
+      const diagnostics = await invoke<ConnectionDiagnostics>(
+        "get_connection_diagnostics",
+      );
+      setConnectionDiagnostics(diagnostics);
+      if (show) setShowConnectionDiagnostics(true);
+    } catch (error) {
+      console.error("接続診断ログを読み込めませんでした", error);
+      props.onNotify(`接続診断ログを読み込めませんでした: ${String(error)}`);
+    }
+  };
+
+  const testAttendanceConnection = async () => {
+    setConnectionTesting(true);
+    setShowConnectionDiagnostics(true);
+    try {
+      const message = await invoke<string>("test_attendance_connection");
+      props.onNotify(message);
+    } catch (error) {
+      console.error("接続テストに失敗しました", error);
+      props.onNotify(`接続テストに失敗しました: ${String(error)}`);
+    } finally {
+      await loadConnectionDiagnostics(false);
+      setConnectionTesting(false);
+    }
+  };
+
+  const copyConnectionDiagnostics = async () => {
+    const diagnostics = connectionDiagnostics();
+    if (!diagnostics) return;
+    try {
+      await navigator.clipboard.writeText(diagnostics.content);
+      props.onNotify("接続診断ログをコピーしました");
+    } catch (error) {
+      props.onNotify(`接続診断ログをコピーできませんでした: ${String(error)}`);
+    }
+  };
+
+  const clearConnectionDiagnostics = async () => {
+    try {
+      await invoke("clear_connection_diagnostics");
+      await loadConnectionDiagnostics(false);
+      props.onNotify("接続診断ログを消去しました");
+    } catch (error) {
+      props.onNotify(`接続診断ログを消去できませんでした: ${String(error)}`);
+    }
+  };
 
   const loadHistory = async () => {
     setLoading(true);
@@ -233,6 +292,8 @@ export default function HistoryPanel(props: HistoryPanelProps) {
     } catch (error) {
       console.error("勤怠を取得できませんでした", error);
       props.onNotify(`勤怠を取得できませんでした: ${String(error)}`);
+      setShowAttendanceSettings(true);
+      await loadConnectionDiagnostics(true);
     } finally {
       setAttendanceLoading(false);
     }
@@ -590,6 +651,60 @@ export default function HistoryPanel(props: HistoryPanelProps) {
               </button>
             </div>
           </form>
+        </Show>
+
+        <Show when={showAttendanceSettings()}>
+          <div class="connection-diagnostics">
+            <div class="connection-diagnostics-toolbar">
+              <div>
+                <strong>接続診断</strong>
+                <span>TLS・証明書・ログイン遷移を記録します</span>
+              </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={testAttendanceConnection}
+                  disabled={connectionTesting()}
+                >
+                  {connectionTesting() ? "テスト中" : "接続テスト"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    showConnectionDiagnostics()
+                      ? setShowConnectionDiagnostics(false)
+                      : loadConnectionDiagnostics()
+                  }
+                >
+                  {showConnectionDiagnostics() ? "閉じる" : "ログを表示"}
+                </button>
+              </div>
+            </div>
+            <Show when={showConnectionDiagnostics()}>
+              <div class="connection-diagnostics-log">
+                <div>
+                  <span title={connectionDiagnostics()?.path}>
+                    {connectionDiagnostics()?.path ?? "ログを読み込み中…"}
+                  </span>
+                  <div>
+                    <button type="button" onClick={copyConnectionDiagnostics}>
+                      コピー
+                    </button>
+                    <button type="button" onClick={clearConnectionDiagnostics}>
+                      消去
+                    </button>
+                  </div>
+                </div>
+                <pre>
+                  {connectionDiagnostics()?.content ||
+                    "診断ログはまだありません。接続テストを実行してください。"}
+                </pre>
+                <p>
+                  認証情報は記録しません。.cerは信頼ルート用です。クライアント証明書認証には秘密鍵が必要です。
+                </p>
+              </div>
+            </Show>
+          </div>
         </Show>
 
         <Show
